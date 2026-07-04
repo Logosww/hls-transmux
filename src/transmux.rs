@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::cancel::CancelToken;
 use crate::codecs::avc;
 use crate::error::{Error, Result};
 use crate::hls::{HlsPlaylist, MediaPlaylist, parse_hls_playlist_content};
@@ -9,6 +11,7 @@ use crate::mp4::{
     make_audio_track, make_hevc_video_track, make_video_track, mfra_box,
 };
 use crate::mpeg_ts::demux_ts;
+use crate::resume::TransmuxResumeState;
 use crate::source::{HlsInput, SourceLocation, SourceReader};
 use crate::types::{DemuxOutput, EncodedPacket, StreamKind, TransmuxReport};
 
@@ -63,7 +66,25 @@ pub enum FinalizeBackend {
 /// All fields have sensible defaults; `Default::default()` transmuxes to a
 /// non-fragmented MP4 and requires the input to be a media playlist (master
 /// playlists require an explicit [`VariantSelection`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// # Progress, cancellation, resume
+///
+/// `on_progress`, `cancel`, and `resume` are all optional (default `None`).
+/// When `None`, the pipeline behaves exactly as it did before these hooks
+/// existed — existing callers and tests do not need to change.
+///
+/// - `on_progress`: invoked synchronously after each segment is fully
+///   processed. The callback receives a [`TransmuxProgress`] which includes
+///   a fresh [`TransmuxResumeState`] snapshot; callers should persist it if
+///   they want to support resume.
+/// - `cancel`: checked at the top of each segment iteration and raced
+///   against `Source::read_bytes` await points. On cancel, the pipeline
+///   returns [`Error::Cancelled`] promptly.
+/// - `resume`: when `Some`, skips `segments[..completed_segments]` and
+///   appends to the existing output file. Only supported for
+///   [`OutputFormat::StreamingMp4`] and [`OutputFormat::FragmentedMp4`];
+///   passing it with [`OutputFormat::Mp4`] returns [`Error::InvalidInput`].
+#[derive(Clone, Default)]
 pub struct TransmuxOptions {
     /// Required when the input is a master playlist; ignored for media playlists.
     pub variant: Option<VariantSelection>,
@@ -72,6 +93,83 @@ pub struct TransmuxOptions {
     /// Finalization backend for [`OutputFormat::StreamingMp4`]. Ignored for
     /// other formats. Default: [`FinalizeBackend::Native`].
     pub finalize_backend: FinalizeBackend,
+    /// Per-segment progress callback. Invoked synchronously after each
+    /// segment is fully processed (demuxed +, for streaming paths, written
+    /// to disk). `None` (default) skips the callback entirely.
+    pub on_progress: Option<Arc<dyn Fn(TransmuxProgress) + Send + Sync>>,
+    /// Cooperative cancellation token. Checked at the top of each segment
+    /// iteration and raced against `Source::read_bytes` await points.
+    pub cancel: Option<Arc<dyn CancelToken>>,
+    /// Resume checkpoint. `None` (default) starts a fresh transmux. `Some`
+    /// resumes an interrupted run by skipping `segments[..completed_segments]`
+    /// and appending to the output file. Only supported for
+    /// [`OutputFormat::StreamingMp4`] and [`OutputFormat::FragmentedMp4`].
+    pub resume: Option<TransmuxResumeState>,
+}
+
+impl std::fmt::Debug for TransmuxOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransmuxOptions")
+            .field("variant", &self.variant)
+            .field("output_format", &self.output_format)
+            .field("finalize_backend", &self.finalize_backend)
+            .field("on_progress", &self.on_progress.as_ref().map(|_| "<callback>"))
+            .field("cancel", &self.cancel.as_ref().map(|_| "<cancel token>"))
+            .field("resume", &self.resume)
+            .finish()
+    }
+}
+
+/// One progress event, emitted via [`TransmuxOptions::on_progress`] after a
+/// segment is fully processed.
+///
+/// The `resume` field is a fresh checkpoint snapshot; callers should persist
+/// it on every callback so a crash or cancel can be resumed from the last
+/// fully-written segment.
+#[derive(Debug, Clone)]
+pub struct TransmuxProgress {
+    /// Total segments in the media playlist.
+    pub total_segments: usize,
+    /// Segments fully processed so far.
+    pub completed_segments: usize,
+    /// Cumulative downloaded segment bytes (excludes init segments).
+    pub downloaded_bytes: u64,
+    /// Bytes written to the output file. 0 for the [`Mp4`](OutputFormat::Mp4)
+    /// batch path (which buffers in memory until the end).
+    pub bytes_written: u64,
+    /// Index of the segment just completed.
+    pub current_segment_index: usize,
+    /// Current resume checkpoint snapshot. Callers should persist this on
+    /// every callback so a crash/cancel can be resumed.
+    pub resume: TransmuxResumeState,
+}
+
+/// Internal bundle of the optional hooks extracted from `TransmuxOptions`,
+/// passed down to the per-segment loops. Holds borrowed `Arc`s so the loops
+/// can invoke the callback / check cancellation without re-reading the
+/// `Option`s each iteration.
+struct Hooks<'a> {
+    on_progress: Option<&'a Arc<dyn Fn(TransmuxProgress) + Send + Sync>>,
+    cancel: Option<&'a Arc<dyn CancelToken>>,
+}
+
+impl<'a> Hooks<'a> {
+    /// Returns `Err(Error::Cancelled)` if the cancel token has been triggered.
+    fn check_cancel(&self) -> Result<()> {
+        if let Some(c) = self.cancel {
+            if c.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+        }
+        Ok(())
+    }
+
+    /// Emits a progress event if a callback is configured. No-op otherwise.
+    fn emit(&self, progress: TransmuxProgress) {
+        if let Some(cb) = self.on_progress {
+            cb(progress);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -128,10 +226,34 @@ pub async fn transmux_hls_to_mp4_async(
         }
     };
 
+    // `Mp4` batch path can't resume (it buffers everything in memory and
+    // writes once at the end — there's nothing to append to). Reject early
+    // so callers get a clear error instead of silent fallback.
+    if options.resume.is_some() && matches!(options.output_format, OutputFormat::Mp4) {
+        return Err(Error::invalid(
+            "resume is only supported with OutputFormat::StreamingMp4 or FragmentedMp4",
+        ));
+    }
+
+    let hooks = Hooks {
+        on_progress: options.on_progress.as_ref(),
+        cancel: options.cancel.as_ref(),
+    };
+
     match options.output_format {
-        OutputFormat::Mp4 => mux_to_mp4(&reader, &media_location, &media_playlist, output).await,
+        OutputFormat::Mp4 => {
+            mux_to_mp4(&reader, &media_location, &media_playlist, output, &hooks).await
+        }
         OutputFormat::FragmentedMp4 => {
-            transmux_fragmented_async(&reader, &media_location, &media_playlist, output).await
+            transmux_fragmented_async(
+                &reader,
+                &media_location,
+                &media_playlist,
+                output,
+                &hooks,
+                options.resume.clone(),
+            )
+            .await
         }
         OutputFormat::StreamingMp4 => {
             // Stage 1: stream the fMP4 pipeline to a temp file (low memory:
@@ -144,10 +266,16 @@ pub async fn transmux_hls_to_mp4_async(
                 &media_location,
                 &media_playlist,
                 &temp_path,
+                &hooks,
+                options.resume.clone(),
             )
             .await;
             if let Err(e) = stage1 {
-                let _ = tokio::fs::remove_file(&temp_path).await;
+                // On cancel, keep the .partial.mp4 so the caller can resume.
+                // Only clean up on actual errors (non-Cancelled).
+                if !matches!(e, Error::Cancelled) {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                }
                 return Err(e);
             }
             let segment_count = media_playlist.segments.len();
@@ -181,9 +309,10 @@ async fn mux_to_mp4(
     media_location: &SourceLocation,
     media_playlist: &MediaPlaylist,
     output: &Path,
+    hooks: &Hooks<'_>,
 ) -> Result<TransmuxReport> {
     let mut collector = PacketCollector::default();
-    read_media_segments(reader, media_location, media_playlist, &mut collector).await?;
+    read_media_segments(reader, media_location, media_playlist, &mut collector, hooks).await?;
 
     let (mp4, mut report) = mux_collected_packets(collector, media_playlist.segments.len())?;
     tokio::fs::write(output, &mp4).await?;
@@ -283,41 +412,134 @@ async fn transmux_fragmented_async(
     media_location: &SourceLocation,
     media_playlist: &MediaPlaylist,
     output: &Path,
+    hooks: &Hooks<'_>,
+    resume: Option<TransmuxResumeState>,
 ) -> Result<TransmuxReport> {
     use tokio::io::AsyncWriteExt;
 
-    let mut output = tokio::fs::File::create(output).await?;
+    let segments = &media_playlist.segments;
+    if segments.is_empty() {
+        return Err(Error::invalid("media playlist contains no segments"));
+    }
+
+    // --- Resume checkpoint validation. We need a non-empty playlist with at
+    // least one unprocessed segment to continue from. Rejecting here keeps
+    // the loop invariant (`start_index < segments.len()`) trivially true.
+    if let Some(r) = &resume {
+        if r.completed_segments >= segments.len() {
+            return Err(Error::invalid(
+                "resume state indicates the playlist is already complete",
+            ));
+        }
+    }
+
+    // --- Output file. Fresh run creates + truncates; resume opens in append
+    // mode at the existing EOF (the byte offset recorded in the checkpoint).
+    // `output_path` is kept for the resume-path file scan (rebuilds tfra).
+    let output_path = output;
+    let mut output = if resume.is_some() {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(output_path)
+            .await?
+    } else {
+        tokio::fs::File::create(output_path).await?
+    };
+
     let mut muxer: Option<FragmentedMp4Muxer> = None;
     let mut layout = TrackLayout::default();
     let mut init_cache: Option<(String, Vec<u8>)> = None;
     let mut saved_tracks: Option<Vec<FragmentedTrack>> = None;
     let mut max_duration_ms = 0_u64;
-    let mut bytes_written = 0_u64;
-
-    // Global base DTS (90k domain) captured from the very first packet across
-    // all segments. All sample DTS/PTS are shifted by this so the first
-    // fragment's tfdt starts at 0 and subsequent fragments' tfdt reflects the
-    // true cumulative position on the (normalized) track timeline. Without
-    // this, the first packet's raw 90k DTS (often non-zero due to TS encoder
-    // initial timestamp offset) leaks into tfdt, inflating the track duration.
-    let mut global_base_dts_90k: Option<u64> = None;
+    let mut downloaded_bytes = 0_u64;
 
     // Per-track tfra entries accumulated as each fragment is streamed to disk;
-    // consumed by the trailing mfra box at the end.
+    // consumed by the trailing mfra box at the end. Fresh runs start empty and
+    // are sized inside the loop when the muxer is first created. Resumed runs
+    // are pre-populated with historical entries rebuilt from the existing
+    // `.partial.mp4` (plan §5.5 enhancement), then new entries are appended as
+    // fresh fragments are written — producing a complete mfra at EOF.
     let mut tfra_entries_per_track: Vec<Vec<TfraEntry>> = Vec::new();
 
-    // --- Streaming: write header, then one (styp + moof + mdat) per segment
-    // directly to the file. The temp file grows as segments are demuxed, so
-    // an interrupted run still leaves a playable fMP4 (ftyp + moov + the
-    // fragments written so far). sidx is intentionally omitted: it must
-    // reference the total size of all fragments, which is unknown until the
-    // end, and writing it would require buffering everything in memory (the
-    // exact pattern we are avoiding). mfra is appended at EOF instead.
-    for segment in &media_playlist.segments {
-        let demuxed = demux_segment(reader, media_location, segment, &mut init_cache).await?;
+    // --- Resume: restore the four checkpoint fields. `tracks` is re-extracted
+    // by re-demuxing segments[0] (codec config must match the original; the
+    // checkpoint does not persist SPS/PPS/ASC bytes — see plan §5.3).
+    // Historical tfra entries are rebuilt by scanning the existing
+    // `.partial.mp4`'s moof boxes (plan §5.5 enhancement), so resumed runs
+    // now emit a complete mfra box matching a fresh run's output.
+    let mut bytes_written: u64 = resume.as_ref().map(|r| r.bytes_written).unwrap_or(0);
+    let mut global_base_dts_90k: Option<u64> =
+        resume.as_ref().map(|r| r.global_base_dts_90k);
+
+    if let Some(r) = &resume {
+        // Re-demux segments[0] to rebuild codec config (tracks). The bytes
+        // are downloaded but not written to the output — only the demux
+        // metadata (SPS/PPS/ASC) is used to construct the muxer.
+        let first_segment = &segments[0];
+        let (first_demuxed, _first_bytes) =
+            demux_segment(reader, media_location, first_segment, &mut init_cache).await?;
+        let tracks = build_fragmented_tracks(&first_demuxed)?;
+        layout = TrackLayout::from_tracks(&tracks);
+        let m = FragmentedMp4Muxer::new_with_sequence(tracks.clone(), r.next_sequence);
+        saved_tracks = Some(tracks);
+        muxer = Some(m);
+
+        // Rebuild historical tfra entries by scanning the existing
+        // `.partial.mp4` (plan §5.5 enhancement). The file's moof boxes are
+        // walked to recover each fragment's track ID, base decode time, and
+        // absolute moof offset. These are mapped to track indices via the
+        // rebuilt tracks and pushed into tfra_entries_per_track, so the
+        // resumed run emits a complete mfra box at EOF (matching a fresh
+        // run's output byte-for-byte).
+        let existing = tokio::fs::read(output_path).await?;
+        // Scan only up to the checkpoint's bytes_written — the file may have
+        // been opened in append mode but nothing has been written yet by this
+        // run, so in practice file size == bytes_written. The min() guards
+        // against accidental truncation.
+        let scan_end = (r.bytes_written as usize).min(existing.len());
+        let scanned = crate::isobmff::extract_tfra_entries(&existing[..scan_end])?;
+        let tracks_ref = saved_tracks.as_ref().expect("tracks were just saved");
+        let track_id_to_index: std::collections::HashMap<u32, usize> = tracks_ref
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.track_id, i))
+            .collect();
+        tfra_entries_per_track = (0..tracks_ref.len()).map(|_| Vec::new()).collect();
+        for entry in scanned {
+            if let Some(&track_index) = track_id_to_index.get(&entry.track_id) {
+                tfra_entries_per_track[track_index].push(TfraEntry {
+                    time: entry.base_decode_time,
+                    moof_offset: entry.moof_offset,
+                    traf_number: 1,
+                    trun_number: 1,
+                    sample_number: 1,
+                });
+            }
+        }
+    }
+
+    let start_index = resume.as_ref().map(|r| r.completed_segments).unwrap_or(0);
+
+    // --- Streaming: write header (fresh run only), then one (styp + moof +
+    // mdat) per segment directly to the file. The temp file grows as segments
+    // are demuxed, so an interrupted run still leaves a playable fMP4 (ftyp +
+    // moov + the fragments written so far). sidx is intentionally omitted: it
+    // must reference the total size of all fragments, which is unknown until
+    // the end, and writing it would require buffering everything in memory
+    // (the exact pattern we are avoiding). mfra is appended at EOF instead.
+    for (loop_index, segment) in segments[start_index..].iter().enumerate() {
+        // Cooperative cancellation: check at the top of each iteration so a
+        // cancelled run stops before downloading the next segment.
+        hooks.check_cancel()?;
+
+        let segment_index = start_index + loop_index;
+        let (demuxed, segment_bytes) =
+            demux_segment(reader, media_location, segment, &mut init_cache).await?;
+        downloaded_bytes += segment_bytes;
 
         // Capture the global base DTS from the first packet we ever see, so
         // every sample across all segments is shifted to a zero-based timeline.
+        // Skipped on resume: the checkpoint already carries the original base.
         if global_base_dts_90k.is_none() {
             if let Some(first) = demuxed.packets.first() {
                 global_base_dts_90k = Some(first.dts_90k);
@@ -385,17 +607,42 @@ async fn transmux_fragmented_async(
                 max_duration_ms = ms;
             }
         }
+
+        // Emit progress with a fresh resume snapshot. The caller should
+        // persist this on every callback so a crash/cancel can resume from
+        // the last fully-written fragment.
+        let next_sequence = muxer.next_sequence();
+        let progress_base = global_base_dts_90k.unwrap_or(0);
+        hooks.emit(TransmuxProgress {
+            total_segments: segments.len(),
+            completed_segments: segment_index + 1,
+            downloaded_bytes,
+            bytes_written,
+            current_segment_index: segment_index,
+            resume: TransmuxResumeState {
+                completed_segments: segment_index + 1,
+                bytes_written,
+                next_sequence,
+                global_base_dts_90k: progress_base,
+            },
+        });
     }
 
-    let tracks = saved_tracks.ok_or_else(|| Error::invalid("no segments were processed"))?;
-    if tfra_entries_per_track.is_empty() {
-        return Err(Error::invalid("no fragments were generated"));
+    if saved_tracks.is_none() {
+        return Err(Error::invalid("no segments were processed"));
     }
 
     // mfra at EOF lets players find sync samples by seeking from the end.
-    let mfra = mfra_box(&tracks, &tfra_entries_per_track)?;
-    output.write_all(&mfra).await?;
-    bytes_written += mfra.len() as u64;
+    // Resumed runs rebuild historical tfra entries by scanning the existing
+    // `.partial.mp4` (plan §5.5), so both fresh and resumed runs emit a
+    // complete mfra box — the outputs are byte-identical (after wall-clock
+    // timestamp normalization).
+    if !tfra_entries_per_track.is_empty() {
+        let tracks_ref = saved_tracks.as_ref().expect("tracks were saved");
+        let mfra = mfra_box(tracks_ref, &tfra_entries_per_track)?;
+        output.write_all(&mfra).await?;
+        bytes_written += mfra.len() as u64;
+    }
 
     output.flush().await?;
 
@@ -440,18 +687,22 @@ impl TrackLayout {
 }
 
 /// Demux a single HLS segment, handling both TS and fMP4/CMAF inputs.
+///
+/// Returns the demuxed packets plus the segment's raw byte length (excluding
+/// any init segment). The byte length is used to populate progress callbacks.
 async fn demux_segment(
     reader: &SourceReader,
     playlist_location: &SourceLocation,
     segment: &crate::hls::HlsSegment,
     init_cache: &mut Option<(String, Vec<u8>)>,
-) -> Result<DemuxOutput> {
+) -> Result<(DemuxOutput, u64)> {
     let location = playlist_location.resolve(&segment.uri)?;
     let data = reader
         .read_bytes(&location, segment.byte_range.as_ref())
         .await?;
+    let segment_bytes = data.len() as u64;
 
-    if let Some(init_spec) = &segment.init_segment {
+    let demuxed = if let Some(init_spec) = &segment.init_segment {
         let init_bytes = if let Some((_, cached_bytes)) = init_cache
             .as_ref()
             .filter(|(uri, _)| uri == &init_spec.uri)
@@ -465,10 +716,11 @@ async fn demux_segment(
             *init_cache = Some((init_spec.uri.clone(), bytes.clone()));
             bytes
         };
-        demux_isobmff(&init_bytes, &data)
+        demux_isobmff(&init_bytes, &data)?
     } else {
-        demux_ts(&data)
-    }
+        demux_ts(&data)?
+    };
+    Ok((demuxed, segment_bytes))
 }
 
 fn build_fragmented_tracks(first: &DemuxOutput) -> Result<Vec<FragmentedTrack>> {
@@ -600,11 +852,37 @@ async fn read_media_segments(
     playlist_location: &SourceLocation,
     playlist: &MediaPlaylist,
     collector: &mut PacketCollector,
+    hooks: &Hooks<'_>,
 ) -> Result<()> {
     let mut init_cache: Option<(String, Vec<u8>)> = None;
-    for segment in &playlist.segments {
-        let demuxed = demux_segment(reader, playlist_location, segment, &mut init_cache).await?;
+    let mut downloaded_bytes = 0_u64;
+    let total_segments = playlist.segments.len();
+
+    for (index, segment) in playlist.segments.iter().enumerate() {
+        // Cooperative cancellation: check before downloading each segment.
+        hooks.check_cancel()?;
+
+        let (demuxed, segment_bytes) =
+            demux_segment(reader, playlist_location, segment, &mut init_cache).await?;
+        downloaded_bytes += segment_bytes;
         collector.push_demuxed(demuxed)?;
+
+        // Mp4 batch path doesn't write to disk per-segment, so bytes_written
+        // stays 0 and the resume snapshot is informational only — Mp4 output
+        // does not support resume (rejected at the entry point).
+        hooks.emit(TransmuxProgress {
+            total_segments,
+            completed_segments: index + 1,
+            downloaded_bytes,
+            bytes_written: 0,
+            current_segment_index: index,
+            resume: TransmuxResumeState {
+                completed_segments: index + 1,
+                bytes_written: 0,
+                next_sequence: (index + 1) as u32,
+                global_base_dts_90k: 0,
+            },
+        });
     }
     Ok(())
 }
@@ -810,6 +1088,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "default-source")]
     async fn rejects_master_without_variant() {
         let temp_dir =
             std::env::temp_dir().join(format!("hls-transmux-master-test-{}", std::process::id()));

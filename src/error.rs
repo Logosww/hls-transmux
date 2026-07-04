@@ -23,6 +23,8 @@ pub enum Error {
     Bitstream(String),
     /// The MP4 muxer could not assemble the output.
     Muxing(String),
+    /// The operation was cancelled via a `CancelToken`.
+    Cancelled,
 }
 
 impl Error {
@@ -58,6 +60,7 @@ impl fmt::Display for Error {
             Self::Unsupported(message) => write!(f, "unsupported feature: {message}"),
             Self::Bitstream(message) => write!(f, "bitstream error: {message}"),
             Self::Muxing(message) => write!(f, "muxing error: {message}"),
+            Self::Cancelled => write!(f, "operation cancelled"),
         }
     }
 }

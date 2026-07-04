@@ -96,6 +96,7 @@
 //! audio groups, multi-track streams, and non-AVC/HEVC/AAV-LC codecs return a
 //! structured [`Error::Unsupported`] variant.
 
+mod cancel;
 mod codecs;
 #[cfg(feature = "ffmpeg-finalize")]
 mod ffmpeg_finalize;
@@ -104,15 +105,19 @@ mod hls;
 mod isobmff;
 mod mp4;
 mod mpeg_ts;
+mod resume;
 mod source;
 mod transmux;
 mod types;
 
+pub use cancel::CancelToken;
 pub use error::{Error, Result};
+pub use resume::TransmuxResumeState;
 pub use source::{ByteRange, HlsInput, Source, SourceLocation, TextResource};
 #[cfg(feature = "default-source")]
 pub use source::ReqwestSource;
 pub use transmux::{
-    FinalizeBackend, OutputFormat, TransmuxOptions, VariantSelection, transmux_hls_to_mp4_async,
+    FinalizeBackend, OutputFormat, TransmuxOptions, TransmuxProgress, VariantSelection,
+    transmux_hls_to_mp4_async,
 };
 pub use types::{Codec, TrackInfo, TrackType, TransmuxReport};

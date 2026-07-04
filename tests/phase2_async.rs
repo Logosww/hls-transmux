@@ -1,3 +1,5 @@
+#![cfg(feature = "default-source")]
+
 use std::fs;
 use std::path::PathBuf;
 

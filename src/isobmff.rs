@@ -517,6 +517,90 @@ pub(crate) fn demux_isobmff(init: &[u8], segment: &[u8]) -> Result<DemuxOutput> 
     Ok(output)
 }
 
+/// One fragment's random-access info extracted by scanning a complete fMP4
+/// file. Used to rebuild `tfra` entries on resume (plan §5.5 enhancement):
+/// the resumed run scans the existing `.partial.mp4` to recover historical
+/// fragment offsets/times, then appends new entries as fresh fragments are
+/// written, producing a complete `mfra` box at EOF.
+#[derive(Debug, Clone)]
+pub(crate) struct ScannedTfraEntry {
+    /// Track ID from the fragment's `tfhd`. Mapped to a track index by the
+    /// caller using the rebuilt `FragmentedTrack` list.
+    pub track_id: u32,
+    /// `base_decode_time` from the fragment's `tfdt` (track timescale). This
+    /// equals the first sample's DTS and is exactly what `TfraEntry.time`
+    /// stores in the fresh-run accumulation path.
+    pub base_decode_time: u64,
+    /// Absolute byte offset of the `moof` box from the start of the file.
+    pub moof_offset: u64,
+}
+
+/// Walks a complete fMP4 file (`ftyp` + `moov` + `[styp` + `moof` + `mdat]*`)
+/// and extracts one [`ScannedTfraEntry`] per `(moof, traf)` pair. Each entry
+/// records the `moof`'s absolute offset, the track ID (from `tfhd`), and the
+/// fragment's base decode time (from `tfdt`).
+///
+/// Used by the resume path to rebuild historical `tfra` entries so the
+/// resumed output includes a complete `mfra` box (matching a fresh run's
+/// output byte-for-byte).
+///
+/// `data` should cover exactly the previously-written portion of the file
+/// (up to the resume checkpoint's `bytes_written`); anything beyond is being
+/// written by the current resumed run and will be accumulated normally.
+pub(crate) fn extract_tfra_entries(data: &[u8]) -> Result<Vec<ScannedTfraEntry>> {
+    let mut entries = Vec::new();
+    let mut offset = 0_usize;
+    while offset + 8 <= data.len() {
+        let header = read_box_header(&data[offset..])?;
+        if offset + header.total_size > data.len() {
+            return Err(Error::bitstream("ISOBMFF box extends past data"));
+        }
+        if &header.box_type == b"moof" {
+            let moof_payload =
+                &data[offset + header.header_size..offset + header.total_size];
+            let moof_offset = offset as u64;
+            extract_tfra_from_moof(moof_payload, moof_offset, &mut entries)?;
+        }
+        offset += header.total_size;
+    }
+    Ok(entries)
+}
+
+/// Iterates `traf` children of a single `moof` and pushes one entry per traf.
+fn extract_tfra_from_moof(
+    moof_payload: &[u8],
+    moof_offset: u64,
+    entries: &mut Vec<ScannedTfraEntry>,
+) -> Result<()> {
+    let mut offset = 0;
+    while offset + 8 <= moof_payload.len() {
+        let header = read_box_header(&moof_payload[offset..])?;
+        if offset + header.total_size > moof_payload.len() {
+            return Err(Error::bitstream("ISOBMFF box extends past moof"));
+        }
+        if &header.box_type == b"traf" {
+            let traf_payload =
+                &moof_payload[offset + header.header_size..offset + header.total_size];
+            let tfhd_data = find_box(traf_payload, b"tfhd")?
+                .ok_or_else(|| Error::bitstream("traf does not contain a tfhd box"))?;
+            let tfhd = parse_tfhd(tfhd_data)?;
+            // tfdt is optional in theory but our muxer always writes it
+            // (version 1, 64-bit). Missing tfdt means base_decode_time = 0.
+            let base_decode_time = match find_box(traf_payload, b"tfdt")? {
+                Some(tfdt_data) => parse_tfdt(tfdt_data)?,
+                None => 0,
+            };
+            entries.push(ScannedTfraEntry {
+                track_id: tfhd.track_id,
+                base_decode_time,
+                moof_offset,
+            });
+        }
+        offset += header.total_size;
+    }
+    Ok(())
+}
+
 fn parse_media_segment(
     segment: &[u8],
     tracks: &[InitTrack],

@@ -47,6 +47,13 @@ hls-transmux = { version = "0.1", default-features = false }
 hls-transmux = { version = "0.1", features = ["ffmpeg-finalize"] }
 ```
 
+可选启用 `serde` feature，为 `TransmuxResumeState` 派生 `Serialize`/`Deserialize`，便于 app 直接持久化续传 checkpoint：
+
+```toml
+[dependencies]
+hls-transmux = { version = "0.1", features = ["serde"] }
+```
+
 ## 自定义 Source
 
 本 crate 只专注 transmux 能力，资源读取（playlist 文本 + segment 字节）通过 [`Source`] trait 抽象。内置 [`ReqwestSource`] 作为默认实现，调用方可以替换为自行实现：
@@ -96,6 +103,162 @@ let report = transmux_hls_to_mp4_async(
 ).await?;
 # Ok(())
 # }
+```
+
+## 进度回调 / 取消 / 续传
+
+`TransmuxOptions` 提供三个可选钩子，均默认 `None`（行为与不传时完全一致，不破坏现有调用方）：
+
+- `on_progress`：逐分片进度回调
+- `cancel`：协作取消令牌
+- `resume`：断点续传 checkpoint
+
+### 进度回调
+
+每个分片处理完成后（demux + 写盘），crate 同步调用 `on_progress` 回调，报告当前进度与续传快照：
+
+```rust
+use std::sync::{Arc, Mutex};
+use hls_transmux::{
+    HlsInput, OutputFormat, TransmuxOptions, TransmuxProgress,
+    transmux_hls_to_mp4_async,
+};
+
+# async fn run() -> hls_transmux::Result<()> {
+let events: Arc<Mutex<Vec<TransmuxProgress>>> = Arc::new(Mutex::new(Vec::new()));
+let events_cb = events.clone();
+
+let report = transmux_hls_to_mp4_async(
+    HlsInput::Path("playlist.m3u8".into()),
+    "output.fmp4",
+    TransmuxOptions {
+        output_format: OutputFormat::FragmentedMp4,
+        on_progress: Some(Arc::new(move |p: TransmuxProgress| {
+            events_cb.lock().unwrap().push(p);
+        })),
+        ..Default::default()
+    },
+)
+.await?;
+# Ok(())
+# }
+```
+
+`TransmuxProgress` 字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `total_segments` | `usize` | playlist 总分片数 |
+| `completed_segments` | `usize` | 已完成分片数 |
+| `downloaded_bytes` | `u64` | 累计已下载分片字节（不含 init segment） |
+| `bytes_written` | `u64` | 已写盘字节（`Mp4` batch 路径恒为 0） |
+| `current_segment_index` | `usize` | 刚完成的分片下标 |
+| `resume` | `TransmuxResumeState` | 当前续传快照，app 应在每次回调时持久化 |
+
+### 协作取消
+
+`cancel` 在每个分片迭代开头检查；取消后返回 `Error::Cancelled`。`StreamingMp4` 路径下 `.partial.mp4` 保留（含已写 fragment，是可播放的 fMP4），可直接用于续传。
+
+```rust
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use hls_transmux::{CancelToken, Error, HlsInput, OutputFormat, TransmuxOptions, transmux_hls_to_mp4_async};
+
+#[derive(Debug, Default)]
+struct MyCancelToken(Arc<AtomicBool>);
+
+impl MyCancelToken {
+    fn trigger(&self) { self.0.store(true, Ordering::SeqCst); }
+}
+
+impl CancelToken for MyCancelToken {
+    fn is_cancelled(&self) -> bool { self.0.load(Ordering::SeqCst) }
+    fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+# async fn run() -> hls_transmux::Result<()> {
+let token = Arc::new(MyCancelToken::default());
+let opts = TransmuxOptions {
+    output_format: OutputFormat::StreamingMp4,
+    cancel: Some(token.clone()),
+    ..Default::default()
+};
+let result = transmux_hls_to_mp4_async(
+    HlsInput::Path("playlist.m3u8".into()),
+    "output.mp4",
+    opts,
+).await;
+// 取消后得到 Error::Cancelled，.partial.mp4 保留
+assert!(matches!(result, Err(Error::Cancelled)));
+# Ok(())
+# }
+```
+
+`CancelToken` 是零依赖 trait，app 侧可包装 `tokio_util::sync::CancellationToken` 或任意取消原语。
+
+### 断点续传
+
+`resume` 让 crate 跳过 `segments[..completed_segments]`，以 append 模式打开已有输出文件继续写。app 负责在每次 `on_progress` 回调时持久化 `TransmuxResumeState` 快照，取消/崩溃后传回 crate 续传。
+
+```rust
+use hls_transmux::{
+    HlsInput, OutputFormat, TransmuxOptions, TransmuxResumeState,
+    transmux_hls_to_mp4_async,
+};
+
+# async fn run() -> hls_transmux::Result<()> {
+// app 从持久化层读回上次保存的 checkpoint
+let saved: TransmuxResumeState = load_from_db()?;
+
+let report = transmux_hls_to_mp4_async(
+    HlsInput::Path("playlist.m3u8".into()),
+    "output.fmp4",           // 同一文件，crate 以 append 模式打开
+    TransmuxOptions {
+        output_format: OutputFormat::FragmentedMp4,
+        resume: Some(saved),
+        ..Default::default()
+    },
+)
+.await?;
+# Ok(())
+# }
+# fn load_from_db() -> hls_transmux::Result<TransmuxResumeState> { unimplemented!() }
+```
+
+`TransmuxResumeState` 4 字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `completed_segments` | `usize` | 已完成分片数；续传跳过 `segments[..completed_segments]` |
+| `bytes_written` | `u64` | 输出文件当前字节偏移；crate 以 append 模式打开后从此偏移继续写 |
+| `next_sequence` | `u32` | 下一个 fragment 的 mfhd sequence number |
+| `global_base_dts_90k` | `u64` | 首包 DTS（90k 时钟域），所有 sample 时间线归零基准 |
+
+**约束**：
+- 仅 `StreamingMp4` / `FragmentedMp4` 支持续传；`Mp4` + `resume` 返回 `Error::InvalidInput`
+- 续传时 crate 重新 demux `segments[0]` 重建 codec config（tracks 不进 checkpoint，跨版本更稳定）
+- 续传完成时 crate 扫描已有 `.partial.mp4` 的 moof 重建历史 `tfra` entries，输出完整 `mfra` box（与首次完成的输出字节一致，仅 wall-clock 时间戳差异）
+
+### `serde` feature
+
+启用 `serde` feature 为 `TransmuxResumeState` 派生 `Serialize`/`Deserialize`，便于 app 直接持久化：
+
+```toml
+[dependencies]
+hls-transmux = { version = "0.1", features = ["serde"] }
+```
+
+```rust
+# #[cfg(feature = "serde")] {
+# use hls_transmux::TransmuxResumeState;
+let json = serde_json::to_string(&resume_state)?;
+let restored: TransmuxResumeState = serde_json::from_str(&json)?;
+# }
+# fn serde_json<T>(_: T) -> Result<T, ()> { unimplemented!() }
 ```
 
 ## 快速开始
@@ -213,12 +376,15 @@ let report = tokio::runtime::Runtime::new()
 | [`HlsInput`] | 输入源（`Path` / `Url` / `Custom`） |
 | [`Source`] / [`SourceLocation`] / [`TextResource`] / [`ByteRange`] | 自定义资源读取的 trait 与配套类型 |
 | [`ReqwestSource`] | 内置 reqwest-backed `Source` 实现（`default-source` feature） |
-| [`TransmuxOptions`] | 选项：`variant`、`output_format`、`finalize_backend` |
+| [`TransmuxOptions`] | 选项：`variant`、`output_format`、`finalize_backend`、`on_progress`、`cancel`、`resume` |
 | [`OutputFormat`] | `Mp4`（默认）/ `FragmentedMp4` / `StreamingMp4` |
 | [`FinalizeBackend`] | `StreamingMp4` 的 finalization 后端：`Native`（默认，自研 defrag）/ `Ffmpeg`（需 `ffmpeg-finalize` feature） |
+| [`TransmuxProgress`] | 进度事件：`total_segments`、`completed_segments`、`downloaded_bytes`、`bytes_written`、`resume` |
+| [`CancelToken`] | 协作取消 trait：`is_cancelled` / `cancelled`（零依赖，app 自实现） |
+| [`TransmuxResumeState`] | 续传 checkpoint：`completed_segments`、`bytes_written`、`next_sequence`、`global_base_dts_90k`（可选 `serde` derive） |
 | [`VariantSelection`] | master playlist 的 variant 选择（目前仅 `Index`） |
 | [`TransmuxReport`] | 返回值：segment 数、track 信息、duration、写入字节数 |
-| [`Error`] / [`Result`] | 结构化错误，区分 I/O、HTTP、非法输入、不支持特性、bitstream、muxing |
+| [`Error`] / [`Result`] | 结构化错误，区分 I/O、HTTP、非法输入、不支持特性、bitstream、muxing、取消 |
 
 完整文档：`cargo doc --open`。
 

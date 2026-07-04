@@ -232,10 +232,11 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "hls-transmux"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "ffmpeg-next",
  "reqwest",
+ "serde",
  "tokio",
  "url",
 ]
@@ -841,6 +842,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

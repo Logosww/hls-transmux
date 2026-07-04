@@ -1146,6 +1146,26 @@ impl FragmentedMp4Muxer {
         }
     }
 
+    /// Resumes a fragmented muxer at a specific sequence number. Used by
+    /// the resume path to continue appending fragments with the correct
+    /// `mfhd` sequence after an interrupted run.
+    pub(crate) fn new_with_sequence(
+        tracks: Vec<FragmentedTrack>,
+        next_sequence: u32,
+    ) -> Self {
+        Self {
+            tracks,
+            next_sequence,
+        }
+    }
+
+    /// Returns the next fragment's `mfhd` sequence number. Used by the
+    /// streaming pipeline to snapshot the resume checkpoint after each
+    /// fragment write.
+    pub(crate) fn next_sequence(&self) -> u32 {
+        self.next_sequence
+    }
+
     pub(crate) fn write_header(&self) -> Result<Vec<u8>> {
         let ftyp = fragmented_ftyp_box();
         // Fragmented moov uses duration=0; the real timeline is carried by

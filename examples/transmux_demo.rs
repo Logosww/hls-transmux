@@ -108,6 +108,7 @@ async fn main() -> hls_transmux::Result<()> {
             variant: Some(VariantSelection::Index(variant_index)),
             output_format: format,
             finalize_backend,
+            ..Default::default()
         },
     )
     .await?;
