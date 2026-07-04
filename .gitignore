@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Internal planning docs (not part of the public package)
+/docs
+
+# Trae workspace state
+/.trae

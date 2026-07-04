@@ -1,0 +1,28 @@
+[package]
+name = "hls-transmux"
+version = "0.1.0"
+edition = "2024"
+description = "A small, dependency-light HLS → MP4 transmuxer for Rust (TS/fMP4 in, MP4/CMAF out)."
+license = "MIT OR Apache-2.0"
+keywords = ["hls", "mp4", "transmux", "cmaf", "isobmff"]
+categories = ["multimedia::video", "multimedia"]
+exclude = ["/docs", "/.trae", "/target"]
+
+[features]
+default = ["default-source"]
+# Built-in reqwest-backed `Source` implementation. Enabled by default. Disable
+# with `default-features = false` to drop the reqwest dependency entirely and
+# plug in your own `Source` implementation via `HlsInput::custom`.
+default-source = ["dep:reqwest"]
+# Use ffmpeg (via ffmpeg-next) for `StreamingMp4` finalization instead of the
+# crate's self-contained ISOBMFF demux + MP4 mux defrag path. Off by default.
+# Requires the FFmpeg 8 shared libraries (libavformat/libavcodec/libavutil) and
+# pkg-config at build time. Selected at runtime via
+# `TransmuxOptions::finalize_backend = FinalizeBackend::Ffmpeg`.
+ffmpeg-finalize = ["dep:ffmpeg-next"]
+
+[dependencies]
+ffmpeg-next = { version = "8.1", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread"] }
+url = "2"
