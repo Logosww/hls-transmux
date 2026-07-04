@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::cancel::CancelToken;
 use crate::codecs::avc;
 use crate::error::{Error, Result};
-use crate::hls::{HlsPlaylist, MediaPlaylist, parse_hls_playlist_content};
+use crate::hls::{HlsPlaylist, MasterPlaylist, MediaPlaylist, parse_hls_playlist_content};
 use crate::isobmff::demux_isobmff;
 use crate::mp4::{
     FragmentedMp4Muxer, FragmentedTrack, Mp4Muxer, Mp4Sample, TfraEntry, assign_delta_durations,
@@ -20,6 +20,48 @@ use crate::types::{DemuxOutput, EncodedPacket, StreamKind, TransmuxReport};
 pub enum VariantSelection {
     /// Zero-based index into the master playlist's variant list.
     Index(usize),
+    /// Select the variant with the highest `BANDWIDTH`. Variants without an
+    /// explicit `BANDWIDTH` attribute are treated as 0. When multiple variants
+    /// share the same (maximum) bandwidth, the last one in playlist order
+    /// wins (Rust's `max_by_key` tie-breaking).
+    HighestBandwidth,
+    /// Select the variant with the lowest `BANDWIDTH`. Variants without an
+    /// explicit `BANDWIDTH` attribute are treated as `u64::MAX`. When multiple
+    /// variants share the same (minimum) bandwidth, the last one in playlist
+    /// order wins (Rust's `min_by_key` tie-breaking).
+    LowestBandwidth,
+}
+
+impl VariantSelection {
+    /// Resolves `self` to a concrete zero-based index into
+    /// `master.variants`, applying the selection strategy.
+    pub(crate) fn select_index(&self, master: &MasterPlaylist) -> Result<usize> {
+        match self {
+            Self::Index(index) => {
+                if *index >= master.variants.len() {
+                    return Err(Error::invalid(format!(
+                        "variant index {index} is out of range for {} variants",
+                        master.variants.len()
+                    )));
+                }
+                Ok(*index)
+            }
+            Self::HighestBandwidth => master
+                .variants
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, v)| v.bandwidth.unwrap_or(0))
+                .map(|(index, _)| index)
+                .ok_or_else(|| Error::invalid("master playlist has no variants")),
+            Self::LowestBandwidth => master
+                .variants
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, v)| v.bandwidth.unwrap_or(u64::MAX))
+                .map(|(index, _)| index)
+                .ok_or_else(|| Error::invalid("master playlist has no variants")),
+        }
+    }
 }
 
 /// Output container format and pipeline.
@@ -203,17 +245,13 @@ pub async fn transmux_hls_to_mp4_async(
     let (media_playlist, media_location) = match root_playlist {
         HlsPlaylist::Media(media) => (media, root_resource.location),
         HlsPlaylist::Master(master) => {
-            let Some(VariantSelection::Index(index)) = options.variant else {
+            let Some(selection) = options.variant else {
                 return Err(Error::invalid(
                     "master playlist input requires TransmuxOptions.variant",
                 ));
             };
-            let variant = master.variants.get(index).ok_or_else(|| {
-                Error::invalid(format!(
-                    "variant index {index} is out of range for {} variants",
-                    master.variants.len()
-                ))
-            })?;
+            let index = selection.select_index(&master)?;
+            let variant = &master.variants[index];
             let variant_location = root_resource.location.resolve(&variant.uri)?;
             let variant_resource = reader.read_text(&variant_location).await?;
             let playlist = parse_hls_playlist_content(None, &variant_resource.content)?;
@@ -1078,13 +1116,96 @@ fn rescale_90k(value: u64, to_timescale: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "default-source")]
     use std::fs;
 
     use super::*;
+    use crate::hls::VariantStream;
+
+    fn variant(uri: &str, bandwidth: Option<u64>) -> VariantStream {
+        VariantStream {
+            uri: uri.to_string(),
+            path: PathBuf::new(),
+            bandwidth,
+            resolution: None,
+            codecs: None,
+        }
+    }
+
+    fn master(variants: Vec<VariantStream>) -> MasterPlaylist {
+        MasterPlaylist {
+            path: PathBuf::new(),
+            variants,
+        }
+    }
 
     #[test]
     fn rescales_90k_to_audio_timescale() {
         assert_eq!(rescale_90k(90_000, 44_100), 44_100);
+    }
+
+    #[test]
+    fn variant_selection_index_returns_specified() {
+        let m = master(vec![variant("a.m3u8", Some(100)), variant("b.m3u8", Some(200))]);
+        assert_eq!(VariantSelection::Index(0).select_index(&m).unwrap(), 0);
+        assert_eq!(VariantSelection::Index(1).select_index(&m).unwrap(), 1);
+    }
+
+    #[test]
+    fn variant_selection_index_out_of_range_errors() {
+        let m = master(vec![variant("a.m3u8", Some(100))]);
+        let err = VariantSelection::Index(5).select_index(&m).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    #[test]
+    fn variant_selection_highest_bandwidth_picks_max() {
+        let m = master(vec![
+            variant("low.m3u8", Some(500_000)),
+            variant("mid.m3u8", Some(1_500_000)),
+            variant("high.m3u8", Some(3_000_000)),
+        ]);
+        assert_eq!(
+            VariantSelection::HighestBandwidth.select_index(&m).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn variant_selection_lowest_bandwidth_picks_min() {
+        let m = master(vec![
+            variant("low.m3u8", Some(500_000)),
+            variant("mid.m3u8", Some(1_500_000)),
+            variant("high.m3u8", Some(3_000_000)),
+        ]);
+        assert_eq!(
+            VariantSelection::LowestBandwidth.select_index(&m).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn variant_selection_highest_bandwidth_with_missing_bandwidth_picks_real() {
+        // Variants without BANDWIDTH are treated as 0 for HighestBandwidth,
+        // so a real-bandwidth variant always wins. When ALL lack bandwidth,
+        // max_by_key returns the last (Rust tie-breaking).
+        let all_missing = master(vec![variant("a.m3u8", None), variant("b.m3u8", None)]);
+        assert_eq!(
+            VariantSelection::HighestBandwidth
+                .select_index(&all_missing)
+                .unwrap(),
+            1
+        );
+
+        let mixed = master(vec![
+            variant("a.m3u8", None),
+            variant("b.m3u8", Some(1_000_000)),
+            variant("c.m3u8", None),
+        ]);
+        assert_eq!(
+            VariantSelection::HighestBandwidth.select_index(&mixed).unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

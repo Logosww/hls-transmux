@@ -105,6 +105,45 @@ let report = transmux_hls_to_mp4_async(
 # }
 ```
 
+## 并发下载
+
+`ReqwestSource` 默认串行下载分片。通过 [`ReqwestSource::with_concurrency`] 启用有界并发预取（opt-in），让内置 HTTP 客户端在 transmuxer 顺序消费之前并发拉取最多 `concurrency` 个分片：
+
+```rust
+use std::sync::Arc;
+use hls_transmux::{
+    HlsInput, OutputFormat, ReqwestSource, SourceLocation,
+    TransmuxOptions, VariantSelection, transmux_hls_to_mp4_async,
+};
+
+# async fn run() -> hls_transmux::Result<()> {
+let source = Arc::new(ReqwestSource::with_concurrency(8));
+let location = SourceLocation::Url(
+    url::Url::parse("https://example.com/media.m3u8").unwrap()
+);
+let report = transmux_hls_to_mp4_async(
+    HlsInput::custom(source, location),
+    "output.fmp4",
+    TransmuxOptions {
+        output_format: OutputFormat::FragmentedMp4,
+        ..Default::default()
+    },
+).await?;
+# Ok(())
+# }
+```
+
+**内存有界**：mpsc channel 作为计数信号量，outstanding（InFlight + Ready-unconsumed）分片数 ≤ `concurrency`。消费侧（`read_bytes`）取出字节后归还 token，coordinator 才会 spawn 下一个 fetch。与 `StreamingMp4` 低内存 pipeline 协同友好。
+
+**触发条件**：
+- `concurrency > 1`
+- 输入为 HTTP/HTTPS URL（本地文件顺序读已足够快，不预取）
+- `read_text` 返回 media playlist（master playlist 不预取 —— variant 尚未选定）
+
+**透明性**：transmuxer 仍按 `segments[i]` 顺序调用 `read_bytes(url)`，并发预取对 transmux 逻辑完全透明 —— 字节可能已在 slot cache 中，也可能需要等 fetch 完成。`concurrency = 1` 走原串行路径，零开销。
+
+`HlsInput::Url` / `HlsInput::Path` 不变（仍用 `ReqwestSource::new()`，串行）；并发用户通过 `HlsInput::custom` 显式传入 `ReqwestSource::with_concurrency(n)` 启用。
+
 ## 进度回调 / 取消 / 续传
 
 `TransmuxOptions` 提供三个可选钩子，均默认 `None`（行为与不传时完全一致，不破坏现有调用方）：
@@ -308,6 +347,16 @@ async fn run() -> hls_transmux::Result<()> {
 }
 ```
 
+`VariantSelection` 三策略：
+
+| 变体 | 行为 |
+| --- | --- |
+| `Index(n)` | 显式指定零基索引（原行为） |
+| `HighestBandwidth` | 选 `BANDWIDTH` 最高的 variant；`bandwidth=None` 视为 0 |
+| `LowestBandwidth` | 选 `BANDWIDTH` 最低的 variant；`bandwidth=None` 视为 `u64::MAX` |
+
+并列时（多个 variant 带宽相同）按 Rust `max_by_key` / `min_by_key` 语义返回最后一个匹配元素。
+
 ### HTTP master playlist → 流式标准 MP4（低内存）
 
 ```rust
@@ -382,7 +431,7 @@ let report = tokio::runtime::Runtime::new()
 | [`TransmuxProgress`] | 进度事件：`total_segments`、`completed_segments`、`downloaded_bytes`、`bytes_written`、`resume` |
 | [`CancelToken`] | 协作取消 trait：`is_cancelled` / `cancelled`（零依赖，app 自实现） |
 | [`TransmuxResumeState`] | 续传 checkpoint：`completed_segments`、`bytes_written`、`next_sequence`、`global_base_dts_90k`（可选 `serde` derive） |
-| [`VariantSelection`] | master playlist 的 variant 选择（目前仅 `Index`） |
+| [`VariantSelection`] | master playlist 的 variant 选择（`Index` / `HighestBandwidth` / `LowestBandwidth`） |
 | [`TransmuxReport`] | 返回值：segment 数、track 信息、duration、写入字节数 |
 | [`Error`] / [`Result`] | 结构化错误，区分 I/O、HTTP、非法输入、不支持特性、bitstream、muxing、取消 |
 

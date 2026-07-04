@@ -1,46 +1,85 @@
 //! Minimal demo: transmux an HLS playlist to a local MP4 file.
 //!
 //! Run with:
-//!     cargo run --example transmux_demo -- <playlist-url-or-path> [output] [variant-index] [--fragmented|--streaming] [--ffmpeg-finalize]
+//!     cargo run --example transmux_demo -- <playlist-url-or-path> [output] [variant-index] [flags]
 //!
 //! Arguments:
 //!     playlist-url-or-path = HLS playlist URL (http/https) or local path (required)
 //!     output               = ./output.mp4 (or ./output.fmp4 with --fragmented)
-//!     variant-index        = 0
-//!     --fragmented     = write fragmented MP4 (ftyp + moov + moof/mdat per segment)
-//!     --streaming      = streaming fMP4 pipeline + finalize to standard MP4
-//!                        (same output as default, lower memory, temp file on disk)
+//!     variant-index        = 0 (positional, backward compat; overridden by --variant)
+//!
+//! Flags:
+//!     --fragmented      = write fragmented MP4 (ftyp + moov + moof/mdat per segment)
+//!     --streaming       = streaming fMP4 pipeline + finalize to standard MP4
 //!     --ffmpeg-finalize = with --streaming, finalize via ffmpeg instead of the
-//!                        built-in defrag path. Requires `--features ffmpeg-finalize`.
+//!                         built-in defrag path. Requires `--features ffmpeg-finalize`.
+//!     --concurrency <n> = concurrent segment prefetch (default 1 = sequential;
+//!                         only effective for HTTP URLs). Requires `default-source`.
+//!     --variant <v>     = variant selection: `highest`, `lowest`, or a numeric
+//!                         index (overrides positional variant-index).
 
 use hls_transmux::{
     FinalizeBackend, HlsInput, OutputFormat, TransmuxOptions, VariantSelection,
     transmux_hls_to_mp4_async,
 };
+#[cfg(feature = "default-source")]
+use {
+    std::sync::Arc,
+    hls_transmux::{ReqwestSource, SourceLocation},
+};
 
 #[tokio::main]
 async fn main() -> hls_transmux::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let fragmented = args.iter().any(|a| a == "--fragmented");
-    let streaming = args.iter().any(|a| a == "--streaming");
-    let ffmpeg_finalize_flag = args.iter().any(|a| a == "--ffmpeg-finalize");
-    let positional: Vec<&String> = args
+
+    // Parse flags that take a value: --concurrency <n>, --variant <v>
+    let mut concurrency: usize = 1;
+    let mut variant_flag: Option<String> = None;
+    let mut remaining: Vec<&String> = Vec::new();
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--concurrency" {
+            let n = iter
+                .next()
+                .ok_or_else(|| hls_transmux::Error::invalid("--concurrency requires a value"))?;
+            concurrency = n
+                .parse()
+                .map_err(|_| hls_transmux::Error::invalid("--concurrency value must be a number"))?;
+        } else if arg == "--variant" {
+            let v = iter
+                .next()
+                .ok_or_else(|| hls_transmux::Error::invalid("--variant requires a value"))?;
+            variant_flag = Some(v.clone());
+        } else if arg == "--fragmented" || arg == "--streaming" || arg == "--ffmpeg-finalize" {
+            remaining.push(arg);
+        } else {
+            remaining.push(arg);
+        }
+    }
+
+    let fragmented = remaining.iter().any(|a| **a == "--fragmented");
+    let streaming = remaining.iter().any(|a| **a == "--streaming");
+    let ffmpeg_finalize_flag = remaining.iter().any(|a| **a == "--ffmpeg-finalize");
+    let positional: Vec<&String> = remaining
         .iter()
         .filter(|a| {
-            *a != "--fragmented" && *a != "--streaming" && *a != "--ffmpeg-finalize"
+            **a != "--fragmented" && **a != "--streaming" && **a != "--ffmpeg-finalize"
         })
+        .copied()
         .collect();
 
     let Some(url) = positional.first() else {
         eprintln!(
             "usage: cargo run --example transmux_demo -- <playlist-url-or-path> \
-             [output] [variant-index] [--fragmented|--streaming] [--ffmpeg-finalize]"
+             [output] [variant-index] [--fragmented|--streaming] [--ffmpeg-finalize] \
+             [--concurrency <n>] [--variant highest|lowest|<index>]"
         );
         eprintln!();
         eprintln!("<playlist-url-or-path> can be an http(s) URL or a local file path.");
         eprintln!("Examples:");
         eprintln!("    cargo run --example transmux_demo -- playlist.m3u8 out.mp4");
         eprintln!("    cargo run --example transmux_demo -- https://example.com/master.m3u8 out.mp4 0");
+        eprintln!("    cargo run --example transmux_demo -- https://example.com/master.m3u8 out.mp4 --variant highest --concurrency 8");
         return Err(hls_transmux::Error::unsupported(
             "missing required <playlist-url-or-path> argument",
         ));
@@ -56,10 +95,24 @@ async fn main() -> hls_transmux::Result<()> {
                 "output.mp4".to_string()
             }
         });
-    let variant_index: usize = positional
-        .get(2)
-        .map(|s| s.parse().expect("variant-index must be a number"))
-        .unwrap_or(0);
+
+    // Resolve variant selection: --variant flag takes precedence over positional index.
+    let variant: VariantSelection = if let Some(v) = &variant_flag {
+        match v.as_str() {
+            "highest" => VariantSelection::HighestBandwidth,
+            "lowest" => VariantSelection::LowestBandwidth,
+            s => VariantSelection::Index(
+                s.parse()
+                    .map_err(|_| hls_transmux::Error::invalid("--variant must be `highest`, `lowest`, or a numeric index"))?,
+            ),
+        }
+    } else {
+        let variant_index: usize = positional
+            .get(2)
+            .map(|s| s.parse().expect("variant-index must be a number"))
+            .unwrap_or(0);
+        VariantSelection::Index(variant_index)
+    };
 
     let format = if fragmented {
         OutputFormat::FragmentedMp4
@@ -86,26 +139,58 @@ async fn main() -> hls_transmux::Result<()> {
         FinalizeBackend::default()
     };
 
-    // Pick `Path` for local inputs, `Url` for http(s) ones. This keeps the
-    // demo usable for both offline fixtures and remote playlists.
-    let input = if url.starts_with("http://") || url.starts_with("https://") {
+    let is_http = url.starts_with("http://") || url.starts_with("https://");
+
+    // Build input. When --concurrency > 1 and input is an HTTP URL, use
+    // ReqwestSource::with_concurrency + HlsInput::custom to enable bounded
+    // concurrent segment prefetch. Otherwise fall back to the simple
+    // HlsInput::Url / HlsInput::Path constructors (sequential).
+    #[cfg(feature = "default-source")]
+    let input = if is_http && concurrency > 1 {
+        let source = ReqwestSource::with_concurrency(concurrency);
+        let location = SourceLocation::Url(url::Url::parse(&url).map_err(|e| {
+            hls_transmux::Error::invalid(format!("invalid URL: {e}"))
+        })?);
+        HlsInput::custom(Arc::new(source), location)
+    } else if is_http {
         HlsInput::Url(url.clone())
     } else {
+        if concurrency > 1 {
+            eprintln!(
+                "warning: --concurrency {concurrency} ignored for local file input \
+                 (concurrent prefetch only applies to HTTP sources)"
+            );
+        }
         HlsInput::Path(std::path::PathBuf::from(url.clone()))
     };
 
-    println!("HLS        : {url}");
-    println!("OUT        : {output}");
-    println!("VAR        : {variant_index}");
-    println!("FORMAT     : {format:?}");
-    println!("FINALIZE   : {finalize_backend:?}");
+    #[cfg(not(feature = "default-source"))]
+    let input = {
+        if concurrency > 1 {
+            eprintln!(
+                "warning: --concurrency {concurrency} ignored (built without `default-source` feature)"
+            );
+        }
+        if is_http {
+            HlsInput::Url(url.clone())
+        } else {
+            HlsInput::Path(std::path::PathBuf::from(url.clone()))
+        }
+    };
+
+    println!("HLS         : {url}");
+    println!("OUT         : {output}");
+    println!("VARIANT     : {variant:?}");
+    println!("FORMAT      : {format:?}");
+    println!("FINALIZE    : {finalize_backend:?}");
+    println!("CONCURRENCY : {concurrency}");
     println!();
 
     let report = transmux_hls_to_mp4_async(
         input,
         &output,
         TransmuxOptions {
-            variant: Some(VariantSelection::Index(variant_index)),
+            variant: Some(variant),
             output_format: format,
             finalize_backend,
             ..Default::default()

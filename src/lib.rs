@@ -76,7 +76,7 @@
 //! - Audio codec: AAC-LC.
 //! - `#EXT-X-BYTERANGE` for both segments and init segments.
 //!
-//! The built-in [`ReqwestSource`] (enabled by the `default-source` cargo
+//! The built-in `ReqwestSource` (enabled by the `default-source` cargo
 //! feature, on by default) handles local files and HTTP/HTTPS. To plug in a
 //! different HTTP client, cache, proxy, or fully offline source, implement
 //! [`Source`] and pass it via [`HlsInput::custom`].
