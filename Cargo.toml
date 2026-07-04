@@ -27,7 +27,7 @@ serde = ["dep:serde"]
 
 [dependencies]
 ffmpeg-next = { version = "8.1", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread"] }
 url = "2"
