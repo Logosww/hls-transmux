@@ -118,6 +118,6 @@ pub use source::{ByteRange, HlsInput, Source, SourceLocation, TextResource};
 pub use source::ReqwestSource;
 pub use transmux::{
     FinalizeBackend, OutputFormat, TransmuxOptions, TransmuxProgress, VariantSelection,
-    transmux_hls_to_mp4_async,
+    transmux_hls_to_mp4_async, transmux_hls_to_writer_async,
 };
 pub use types::{Codec, TrackInfo, TrackType, TransmuxReport};

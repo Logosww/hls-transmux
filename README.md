@@ -483,15 +483,92 @@ let report = tokio::runtime::Runtime::new()
     .unwrap();
 ```
 
+## 流式 writer API（fMP4 → AsyncWrite sink）
+
+[`transmux_hls_to_writer_async`] 把 fMP4 字节直接写到任意
+`tokio::io::AsyncWrite` sink（HTTP response body / `tokio::io::duplex` /
+管道 / 内存 buffer），不再强制落盘到文件路径。第一个 segment demux + mux
+完即写入 sink，不等后续 segment，支持 "边下边推" 场景（浏览器 `<video>` + MSE
+边下边播）。
+
+仅支持 [`OutputFormat::FragmentedMp4`]；`Mp4`（batch）与 `StreamingMp4`
+（末端 defrag）会返回 `Error::InvalidInput`。`resume` 也不支持（sink 不可 seek，
+无法重建 tfra 索引）。[`TransmuxOptions::write_mfra`]（默认 `true`）控制末端
+`mfra` box：流式 HTTP sink 不可 seek 时可设 `false` 跳过。
+
+```rust
+use hls_transmux::{
+    HlsInput, OutputFormat, TransmuxOptions, transmux_hls_to_writer_async,
+};
+
+# async fn run() -> hls_transmux::Result<()> {
+let mut buf: Vec<u8> = Vec::new();
+let report = transmux_hls_to_writer_async(
+    HlsInput::Path("playlist.m3u8".into()),
+    &mut buf,
+    TransmuxOptions {
+        output_format: OutputFormat::FragmentedMp4,
+        ..Default::default()
+    },
+)
+.await?;
+println!("wrote {} bytes (fMP4 in memory)", report.bytes_written);
+# Ok(())
+# }
+```
+
+典型 streaming 场景用 `tokio::io::duplex` 接收字节，spawn 一个 task 把字节
+推给下游（HTTP chunked response / IPC pipe 等）：
+
+```rust,no_run
+use hls_transmux::{
+    HlsInput, OutputFormat, TransmuxOptions, transmux_hls_to_writer_async,
+};
+use tokio::io::AsyncReadExt;
+
+# async fn run() -> hls_transmux::Result<()> {
+let (mut tx, mut rx) = tokio::io::duplex(256 * 1024);
+
+// spawn 一个 task：从 rx 读字节推给下游
+let pump = tokio::spawn(async move {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match rx.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => { /* push buf[..n] to HTTP response / pipe / etc. */ }
+            Err(_) => break,
+        }
+    }
+});
+
+// 当前 task 调用 writer API，写满 duplex 时自动背压
+let report = transmux_hls_to_writer_async(
+    HlsInput::Path("playlist.m3u8".into()),
+    &mut tx,
+    TransmuxOptions {
+        output_format: OutputFormat::FragmentedMp4,
+        ..Default::default()
+    },
+).await?;
+
+drop(tx);  // 让 pump 自然结束
+pump.await.ok();
+# Ok(())
+# }
+```
+
+详见 [docs/writer-streaming-api.md](file:///Users/wangzhili/Desktop/Native/hls-transmux/docs/writer-streaming-api.md)。
+
 ## API 一览
 
 | 名称                                                               | 说明                                                                                                                  |
 | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
-| [`transmux_hls_to_mp4_async`]                                      | 唯一入口，支持本地/HTTP/自定义 Source、master playlist、byterange、fMP4 输入与三种输出格式                            |
+| [`transmux_hls_to_mp4_async`]                                      | 文件路径入口，支持本地/HTTP/自定义 Source、master playlist、byterange、fMP4 输入与三种输出格式                        |
+| [`transmux_hls_to_writer_async`]                                   | 流式 writer 入口（fMP4 → 任意 `AsyncWrite` sink），仅 `FragmentedMp4`，不支持 resume                                  |
 | [`HlsInput`]                                                       | 输入源（`Path` / `Url` / `Custom`）                                                                                   |
 | [`Source`] / [`SourceLocation`] / [`TextResource`] / [`ByteRange`] | 自定义资源读取的 trait 与配套类型                                                                                     |
 | [`ReqwestSource`]                                                  | 内置 reqwest-backed `Source` 实现（`default-source` feature）                                                         |
-| [`TransmuxOptions`]                                                | 选项：`variant`、`output_format`、`finalize_backend`、`on_progress`、`cancel`、`resume`                               |
+| [`TransmuxOptions`]                                                | 选项：`variant`、`output_format`、`finalize_backend`、`on_progress`、`cancel`、`resume`、`write_mfra`                |
 | [`OutputFormat`]                                                   | `Mp4`（默认）/ `FragmentedMp4` / `StreamingMp4`                                                                       |
 | [`FinalizeBackend`]                                                | `StreamingMp4` 的 finalization 后端：`Native`（默认，自研 defrag）/ `Ffmpeg`（需 `ffmpeg-finalize` feature）          |
 | [`TransmuxProgress`]                                               | 进度事件：`total_segments`、`completed_segments`、`downloaded_bytes`、`bytes_written`、`resume`                       |

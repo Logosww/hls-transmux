@@ -12,7 +12,7 @@ use crate::mp4::{
 };
 use crate::mpeg_ts::demux_ts;
 use crate::resume::TransmuxResumeState;
-use crate::source::{HlsInput, SourceLocation, SourceReader};
+use crate::source::{HlsInput, SourceLocation, SourceReader, TextResource};
 use crate::types::{DemuxOutput, EncodedPacket, StreamKind, TransmuxReport};
 
 /// Selects which variant of a master playlist to transmux.
@@ -126,7 +126,7 @@ pub enum FinalizeBackend {
 ///   appends to the existing output file. Only supported for
 ///   [`OutputFormat::StreamingMp4`] and [`OutputFormat::FragmentedMp4`];
 ///   passing it with [`OutputFormat::Mp4`] returns [`Error::InvalidInput`].
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TransmuxOptions {
     /// Required when the input is a master playlist; ignored for media playlists.
     pub variant: Option<VariantSelection>,
@@ -147,6 +147,29 @@ pub struct TransmuxOptions {
     /// and appending to the output file. Only supported for
     /// [`OutputFormat::StreamingMp4`] and [`OutputFormat::FragmentedMp4`].
     pub resume: Option<TransmuxResumeState>,
+    /// Whether to append a trailing `mfra` box at the end of fMP4 output.
+    /// Only affects [`OutputFormat::FragmentedMp4`] and the stage-1 temp
+    /// file of [`OutputFormat::StreamingMp4`]. Default: `true` (matches
+    /// historical behavior). The writer entry point
+    /// ([`transmux_hls_to_writer_async`]) honors this flag so callers
+    /// targeting a non-seekable streaming sink can set it to `false` to
+    /// skip the trailing index (it has little value when the sink cannot
+    /// be seeked from the end).
+    pub write_mfra: bool,
+}
+
+impl Default for TransmuxOptions {
+    fn default() -> Self {
+        Self {
+            variant: None,
+            output_format: OutputFormat::default(),
+            finalize_backend: FinalizeBackend::default(),
+            on_progress: None,
+            cancel: None,
+            resume: None,
+            write_mfra: true,
+        }
+    }
 }
 
 impl std::fmt::Debug for TransmuxOptions {
@@ -158,6 +181,7 @@ impl std::fmt::Debug for TransmuxOptions {
             .field("on_progress", &self.on_progress.as_ref().map(|_| "<callback>"))
             .field("cancel", &self.cancel.as_ref().map(|_| "<cancel token>"))
             .field("resume", &self.resume)
+            .field("write_mfra", &self.write_mfra)
             .finish()
     }
 }
@@ -240,29 +264,8 @@ pub async fn transmux_hls_to_mp4_async(
     let (root_location, source) = input.into_parts()?;
     let reader = SourceReader::new(source);
     let root_resource = reader.read_text(&root_location).await?;
-    let root_playlist = parse_hls_playlist_content(None, &root_resource.content)?;
-
-    let (media_playlist, media_location) = match root_playlist {
-        HlsPlaylist::Media(media) => (media, root_resource.location),
-        HlsPlaylist::Master(master) => {
-            let Some(selection) = options.variant else {
-                return Err(Error::invalid(
-                    "master playlist input requires TransmuxOptions.variant",
-                ));
-            };
-            let index = selection.select_index(&master)?;
-            let variant = &master.variants[index];
-            let variant_location = root_resource.location.resolve(&variant.uri)?;
-            let variant_resource = reader.read_text(&variant_location).await?;
-            let playlist = parse_hls_playlist_content(None, &variant_resource.content)?;
-            let HlsPlaylist::Media(media) = playlist else {
-                return Err(Error::unsupported(
-                    "nested master playlists are out of the Phase 2 slice",
-                ));
-            };
-            (media, variant_resource.location)
-        }
-    };
+    let (media_playlist, media_location) =
+        resolve_media_playlist(&reader, &root_resource, options.variant).await?;
 
     // `Mp4` batch path can't resume (it buffers everything in memory and
     // writes once at the end — there's nothing to append to). Reject early
@@ -335,6 +338,157 @@ pub async fn transmux_hls_to_mp4_async(
 
             let _ = tokio::fs::remove_file(&temp_path).await;
             result
+        }
+    }
+}
+
+/// Streams HLS to a fragmented MP4 written directly into `writer`.
+///
+/// Unlike [`transmux_hls_to_mp4_async`] (which writes to a file path), this
+/// entry point accepts any [`tokio::io::AsyncWrite`] sink — an HTTP response
+/// body, a `tokio::io::duplex`, a pipe, or an in-memory `Vec<u8>`. The
+/// transmuxer writes `ftyp` + `moov` after the first segment is demuxed, then
+/// one `styp` + `moof` + `mdat` per segment as it is consumed, so the sink
+/// receives playable fMP4 bytes before all segments are processed.
+///
+/// # Constraints
+///
+/// - `options.output_format` **must** be [`OutputFormat::FragmentedMp4`].
+///   [`OutputFormat::Mp4`] (batch pipeline) and [`OutputFormat::StreamingMp4`]
+///   (defragments at end) are rejected with [`Error::InvalidInput`].
+/// - `options.resume` **must** be `None`. Resume requires re-reading the
+///   already-written output to rebuild the `mfra` index, which is not possible
+///   for a non-seekable sink. Passing `Some` is rejected with
+///   [`Error::InvalidInput`].
+///
+/// # Trailing `mfra`
+///
+/// Controlled by [`TransmuxOptions::write_mfra`] (default `true`). For
+/// non-seekable streaming sinks (e.g. an HTTP chunked response), the trailing
+/// `mfra` box has little value since the player cannot seek from the end;
+/// callers may set `write_mfra: false` to skip it. With `write_mfra: true`,
+/// the byte sequence written to `writer` is identical to what
+/// `transmux_hls_to_mp4_async` writes to a file at the same
+/// `OutputFormat::FragmentedMp4` setting.
+///
+/// # Completion semantics
+///
+/// Before returning `Ok(report)`, the function calls `writer.flush().await?`
+/// so all bytes are pushed to the sink. On [`Error::Cancelled`], bytes
+/// already written to the sink are not rolled back — the caller is
+/// responsible for sink cleanup.
+///
+/// # Example
+///
+/// ```no_run
+/// use hls_transmux::{
+///     HlsInput, OutputFormat, TransmuxOptions, transmux_hls_to_writer_async,
+/// };
+///
+/// # async fn run() -> hls_transmux::Result<()> {
+/// let mut buf: Vec<u8> = Vec::new();
+/// let report = transmux_hls_to_writer_async(
+///     HlsInput::Path("playlist.m3u8".into()),
+///     &mut buf,
+///     TransmuxOptions {
+///         output_format: OutputFormat::FragmentedMp4,
+///         ..Default::default()
+///     },
+/// )
+/// .await?;
+/// println!("wrote {} bytes (fMP4 in memory)", report.bytes_written);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn transmux_hls_to_writer_async<W>(
+    input: HlsInput,
+    writer: &mut W,
+    options: TransmuxOptions,
+) -> Result<TransmuxReport>
+where
+    W: tokio::io::AsyncWrite + Send + Unpin,
+{
+    match options.output_format {
+        OutputFormat::Mp4 => {
+            return Err(Error::invalid(
+                "writer API requires OutputFormat::FragmentedMp4; \
+                 Mp4 uses a batch pipeline that buffers everything in memory",
+            ));
+        }
+        OutputFormat::StreamingMp4 => {
+            return Err(Error::invalid(
+                "writer API requires OutputFormat::FragmentedMp4; \
+                 StreamingMp4 defragments at end and cannot stream",
+            ));
+        }
+        OutputFormat::FragmentedMp4 => {}
+    }
+
+    if options.resume.is_some() {
+        return Err(Error::invalid(
+            "writer API does not support resume (sink is not seekable)",
+        ));
+    }
+
+    let (root_location, source) = input.into_parts()?;
+    let reader = SourceReader::new(source);
+    let root_resource = reader.read_text(&root_location).await?;
+    let (media_playlist, media_location) =
+        resolve_media_playlist(&reader, &root_resource, options.variant).await?;
+
+    let hooks = Hooks {
+        on_progress: options.on_progress.as_ref(),
+        cancel: options.cancel.as_ref(),
+    };
+
+    transmux_fragmented_to_writer(
+        &reader,
+        &media_location,
+        &media_playlist,
+        writer,
+        &hooks,
+        None, // resume: always None (rejected above)
+        None, // resume_existing: always None (writer sink not re-readable)
+        options.write_mfra,
+    )
+    .await
+}
+
+/// Resolves the root resource into a `(MediaPlaylist, SourceLocation)` pair.
+///
+/// If the root playlist is a master playlist, resolves the selected variant
+/// (requires `variant` to be `Some`) and fetches its media playlist. If the
+/// root playlist is already a media playlist, returns it directly with its
+/// resolved location.
+///
+/// Shared by [`transmux_hls_to_mp4_async`] and
+/// [`transmux_hls_to_writer_async`] so both entry points apply identical
+/// master/variant resolution logic.
+async fn resolve_media_playlist(
+    reader: &SourceReader,
+    root_resource: &TextResource,
+    variant: Option<VariantSelection>,
+) -> Result<(MediaPlaylist, SourceLocation)> {
+    let root_playlist = parse_hls_playlist_content(None, &root_resource.content)?;
+    match root_playlist {
+        HlsPlaylist::Media(media) => Ok((media, root_resource.location.clone())),
+        HlsPlaylist::Master(master) => {
+            let Some(selection) = variant else {
+                return Err(Error::invalid(
+                    "master playlist input requires TransmuxOptions.variant",
+                ));
+            };
+            let index = selection.select_index(&master)?;
+            let variant_uri = &master.variants[index].uri;
+            let variant_location = root_resource.location.resolve(variant_uri)?;
+            let variant_resource = reader.read_text(&variant_location).await?;
+            let playlist = parse_hls_playlist_content(None, &variant_resource.content)?;
+            let HlsPlaylist::Media(media) = playlist else {
+                return Err(Error::unsupported(
+                    "nested master playlists are not supported",
+                ));
+            };
+            Ok((media, variant_resource.location))
         }
     }
 }
@@ -453,6 +607,77 @@ async fn transmux_fragmented_async(
     hooks: &Hooks<'_>,
     resume: Option<TransmuxResumeState>,
 ) -> Result<TransmuxReport> {
+    // Early resume validation: reject "already complete" before touching the
+    // filesystem. The core writer function re-checks this, but validating
+    // here avoids a NotFound Io error when the output file doesn't exist yet
+    // (the file read below would fail first otherwise).
+    if let Some(r) = &resume {
+        if r.completed_segments >= media_playlist.segments.len() {
+            return Err(Error::invalid(
+                "resume state indicates the playlist is already complete",
+            ));
+        }
+    }
+
+    // Resume: read the existing file's bytes up front so the core writer
+    // function can rebuild historical tfra entries. `tokio::fs::read` opens
+    // its own read handle, so doing this before opening the file for append
+    // is equivalent to the prior in-place read. Fresh runs skip this.
+    let resume_existing: Option<Vec<u8>> = if resume.is_some() {
+        Some(tokio::fs::read(output).await?)
+    } else {
+        None
+    };
+
+    let mut file = if resume.is_some() {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(output)
+            .await?
+    } else {
+        tokio::fs::File::create(output).await?
+    };
+
+    // File path version always writes mfra (unchanged historical behavior).
+    // The `options.write_mfra` flag only affects the writer entry point.
+    transmux_fragmented_to_writer(
+        reader,
+        media_location,
+        media_playlist,
+        &mut file,
+        hooks,
+        resume,
+        resume_existing.as_deref(),
+        true,
+    )
+    .await
+}
+
+/// fMP4 streaming transmux core loop shared by the file path entry point
+/// ([`transmux_fragmented_async`]) and the writer entry point
+/// ([`transmux_hls_to_writer_async`]).
+///
+/// Writes `ftyp` + `moov` header on the first segment, then one
+/// `styp` + `moof` + `mdat` per segment directly to `writer`, and optionally
+/// a trailing `mfra` box at EOF.
+///
+/// `resume_existing` carries the already-written output bytes for the
+/// file-path resume case (so tfra entries can be rebuilt by scanning moof
+/// boxes). The writer entry point always passes `None` (it rejects resume
+/// upfront). `write_mfra` controls the trailing mfra box.
+async fn transmux_fragmented_to_writer<W>(
+    reader: &SourceReader,
+    media_location: &SourceLocation,
+    media_playlist: &MediaPlaylist,
+    writer: &mut W,
+    hooks: &Hooks<'_>,
+    resume: Option<TransmuxResumeState>,
+    resume_existing: Option<&[u8]>,
+    write_mfra: bool,
+) -> Result<TransmuxReport>
+where
+    W: tokio::io::AsyncWrite + Send + Unpin,
+{
     use tokio::io::AsyncWriteExt;
 
     let segments = &media_playlist.segments;
@@ -471,19 +696,6 @@ async fn transmux_fragmented_async(
         }
     }
 
-    // --- Output file. Fresh run creates + truncates; resume opens in append
-    // mode at the existing EOF (the byte offset recorded in the checkpoint).
-    // `output_path` is kept for the resume-path file scan (rebuilds tfra).
-    let output_path = output;
-    let mut output = if resume.is_some() {
-        tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(output_path)
-            .await?
-    } else {
-        tokio::fs::File::create(output_path).await?
-    };
-
     let mut muxer: Option<FragmentedMp4Muxer> = None;
     let mut layout = TrackLayout::default();
     let mut init_cache: Option<(String, Vec<u8>)> = None;
@@ -491,20 +703,20 @@ async fn transmux_fragmented_async(
     let mut max_duration_ms = 0_u64;
     let mut downloaded_bytes = 0_u64;
 
-    // Per-track tfra entries accumulated as each fragment is streamed to disk;
-    // consumed by the trailing mfra box at the end. Fresh runs start empty and
-    // are sized inside the loop when the muxer is first created. Resumed runs
-    // are pre-populated with historical entries rebuilt from the existing
-    // `.partial.mp4` (plan §5.5 enhancement), then new entries are appended as
-    // fresh fragments are written — producing a complete mfra at EOF.
+    // Per-track tfra entries accumulated as each fragment is streamed to the
+    // writer; consumed by the trailing mfra box at the end. Fresh runs start
+    // empty and are sized inside the loop when the muxer is first created.
+    // Resumed runs are pre-populated with historical entries rebuilt from
+    // `resume_existing` (the file-path case), then new entries are appended
+    // as fresh fragments are written — producing a complete mfra at EOF.
     let mut tfra_entries_per_track: Vec<Vec<TfraEntry>> = Vec::new();
 
     // --- Resume: restore the four checkpoint fields. `tracks` is re-extracted
     // by re-demuxing segments[0] (codec config must match the original; the
     // checkpoint does not persist SPS/PPS/ASC bytes — see plan §5.3).
-    // Historical tfra entries are rebuilt by scanning the existing
-    // `.partial.mp4`'s moof boxes (plan §5.5 enhancement), so resumed runs
-    // now emit a complete mfra box matching a fresh run's output.
+    // Historical tfra entries are rebuilt by scanning the existing bytes
+    // (`resume_existing`), so resumed runs emit a complete mfra box matching
+    // a fresh run's output byte-for-byte.
     let mut bytes_written: u64 = resume.as_ref().map(|r| r.bytes_written).unwrap_or(0);
     let mut global_base_dts_90k: Option<u64> =
         resume.as_ref().map(|r| r.global_base_dts_90k);
@@ -522,18 +734,17 @@ async fn transmux_fragmented_async(
         saved_tracks = Some(tracks);
         muxer = Some(m);
 
-        // Rebuild historical tfra entries by scanning the existing
-        // `.partial.mp4` (plan §5.5 enhancement). The file's moof boxes are
+        // Rebuild historical tfra entries by scanning the existing output
+        // bytes (passed in by the file-path wrapper). The moof boxes are
         // walked to recover each fragment's track ID, base decode time, and
         // absolute moof offset. These are mapped to track indices via the
         // rebuilt tracks and pushed into tfra_entries_per_track, so the
         // resumed run emits a complete mfra box at EOF (matching a fresh
-        // run's output byte-for-byte).
-        let existing = tokio::fs::read(output_path).await?;
-        // Scan only up to the checkpoint's bytes_written — the file may have
-        // been opened in append mode but nothing has been written yet by this
-        // run, so in practice file size == bytes_written. The min() guards
-        // against accidental truncation.
+        // run's output byte-for-byte). The writer entry point never reaches
+        // here (it rejects resume upfront).
+        let existing = resume_existing.unwrap_or(&[]);
+        // Scan only up to the checkpoint's bytes_written — guards against
+        // any accidental truncation or padding beyond the checkpoint.
         let scan_end = (r.bytes_written as usize).min(existing.len());
         let scanned = crate::isobmff::extract_tfra_entries(&existing[..scan_end])?;
         let tracks_ref = saved_tracks.as_ref().expect("tracks were just saved");
@@ -559,7 +770,7 @@ async fn transmux_fragmented_async(
     let start_index = resume.as_ref().map(|r| r.completed_segments).unwrap_or(0);
 
     // --- Streaming: write header (fresh run only), then one (styp + moof +
-    // mdat) per segment directly to the file. The temp file grows as segments
+    // mdat) per segment directly to the writer. The output grows as segments
     // are demuxed, so an interrupted run still leaves a playable fMP4 (ftyp +
     // moov + the fragments written so far). sidx is intentionally omitted: it
     // must reference the total size of all fragments, which is unknown until
@@ -591,7 +802,7 @@ async fn transmux_fragmented_async(
             tfra_entries_per_track = (0..tracks.len()).map(|_| Vec::new()).collect();
             let m = FragmentedMp4Muxer::new(tracks.clone());
             let header = m.write_header()?;
-            output.write_all(&header).await?;
+            writer.write_all(&header).await?;
             bytes_written += header.len() as u64;
             saved_tracks = Some(tracks);
             muxer = Some(m);
@@ -601,7 +812,7 @@ async fn transmux_fragmented_async(
         let samples_per_track = group_samples_per_track(&demuxed.packets, &layout, base)?;
 
         // Record per-track tfra entries before writing the fragment, using the
-        // current file offset (pointing at the styp that starts this fragment).
+        // current writer offset (pointing at the styp that starts this fragment).
         // Each fragment begins with an styp box; its size (first 4 bytes) is
         // the offset of the moof within the fragment.
         let pre_write_offset = bytes_written;
@@ -636,7 +847,7 @@ async fn transmux_fragmented_async(
             }
         }
 
-        output.write_all(&fragment_bytes).await?;
+        writer.write_all(&fragment_bytes).await?;
         bytes_written += fragment_bytes.len() as u64;
 
         if let Some(last) = demuxed.packets.last() {
@@ -672,17 +883,18 @@ async fn transmux_fragmented_async(
 
     // mfra at EOF lets players find sync samples by seeking from the end.
     // Resumed runs rebuild historical tfra entries by scanning the existing
-    // `.partial.mp4` (plan §5.5), so both fresh and resumed runs emit a
-    // complete mfra box — the outputs are byte-identical (after wall-clock
-    // timestamp normalization).
-    if !tfra_entries_per_track.is_empty() {
+    // output (plan §5.5), so both fresh and resumed runs emit a complete
+    // mfra box — the outputs are byte-identical (after wall-clock timestamp
+    // normalization). The writer entry point may skip this via `write_mfra`
+    // for non-seekable streaming sinks.
+    if write_mfra && !tfra_entries_per_track.is_empty() {
         let tracks_ref = saved_tracks.as_ref().expect("tracks were saved");
         let mfra = mfra_box(tracks_ref, &tfra_entries_per_track)?;
-        output.write_all(&mfra).await?;
+        writer.write_all(&mfra).await?;
         bytes_written += mfra.len() as u64;
     }
 
-    output.flush().await?;
+    writer.flush().await?;
 
     Ok(TransmuxReport {
         segment_count: media_playlist.segments.len(),
