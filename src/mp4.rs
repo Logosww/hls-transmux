@@ -730,10 +730,25 @@ fn mp4a_entry(sample_rate: u32, channel_count: u8, asc: &[u8]) -> Result<Vec<u8>
 
 fn esds_box(asc: &[u8]) -> Result<Vec<u8>> {
     full_box_result(b"esds", 0, 0, |out| {
+        // MPEG-4 descriptor length = size of content ONLY (not tag + length
+        // bytes). A parent descriptor's content includes the FULL child
+        // descriptor (tag + length_bytes + child_content). Many demuxers
+        // (QuickTime, Chrome, ffmpeg) scan for tags and ignore the length
+        // fields, but PotPlayer strictly follows them — undercounting causes
+        // it to read AudioSpecificConfig from the wrong offset.
         let decoder_specific_len = asc.len();
-        let decoder_config_len =
-            13 + descriptor_len_size(decoder_specific_len) + decoder_specific_len;
-        let es_len = 3 + descriptor_len_size(decoder_config_len) + decoder_config_len;
+        // DSI total = tag(1) + len_bytes + content
+        let dsi_total =
+            1 + descriptor_len_size(decoder_specific_len) + decoder_specific_len;
+        // DCD content = 13 fixed fields + full DSI
+        let decoder_config_len = 13 + dsi_total;
+        // DCD total = tag(1) + len_bytes + content
+        let dcd_total =
+            1 + descriptor_len_size(decoder_config_len) + decoder_config_len;
+        // SLC total = tag(1) + len_bytes + content(1)
+        let slc_total = 1 + descriptor_len_size(1) + 1;
+        // ES content = 3 (ES_ID + flags) + full DCD + full SLC
+        let es_len = 3 + dcd_total + slc_total;
 
         descriptor(out, 0x03, es_len)?;
         be_u16(out, 1);
@@ -760,16 +775,11 @@ fn descriptor(out: &mut Vec<u8>, tag: u8, len: usize) -> Result<()> {
     write_descriptor_len(out, len)
 }
 
-fn descriptor_len_size(len: usize) -> usize {
-    if len < 0x80 {
-        1
-    } else if len < 0x4000 {
-        2
-    } else if len < 0x20_0000 {
-        3
-    } else {
-        4
-    }
+fn descriptor_len_size(_len: usize) -> usize {
+    // Always use the 4-byte extended form (0x80 0x80 0x80 <len>). This
+    // matches ffmpeg/MP4Box output and avoids interop issues with demuxers
+    // (e.g. PotPlayer) that misparse the minimal 1-byte length form.
+    4
 }
 
 fn write_descriptor_len(out: &mut Vec<u8>, len: usize) -> Result<()> {

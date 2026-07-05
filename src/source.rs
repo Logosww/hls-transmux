@@ -102,10 +102,14 @@ pub trait Source: Send + Sync + std::fmt::Debug {
 /// bounded concurrent prefetch, use [`ReqwestSource::with_concurrency`] (or
 /// [`ReqwestSource::with_client_and_concurrency`]) with `concurrency > 1`.
 /// When enabled, the source detects media playlists returned by `read_text`
-/// and spawns a background coordinator that prefetches up to `concurrency`
-/// segments ahead of the transmuxer's sequential consumption. Memory is
-/// bounded: at most `concurrency` segment bodies are held in flight or ready
-/// at any time. This is transparent to the transmuxer — it still calls
+/// and spawns `concurrency` background workers that prefetch up to
+/// `concurrency * 3` segments ahead of the transmuxer's sequential
+/// consumption. Memory is bounded: at most `concurrency * 3` segment bodies
+/// are held in flight or ready at any time (matching the backpressure of
+/// `semaphore(N) in-flight + channel(2N) buffered = 3N`). When the
+/// transmuxer races ahead of prefetch, the consumer self-builds a slot and
+/// spawns a one-shot fetch (no redundant direct-fetch competing for
+/// bandwidth). This is transparent to the transmuxer — it still calls
 /// `read_bytes(url)` sequentially, but the bytes may already be cached.
 ///
 /// Local file inputs and master playlists are never prefetched.
@@ -118,6 +122,12 @@ pub struct ReqwestSource {
     /// `read_text` may be called twice (master → variant) and only the variant
     /// (media) playlist should trigger prefetch.
     state: std::sync::OnceLock<std::sync::Arc<PrefetchState>>,
+    /// Cancel signal held by `ReqwestSource` (NOT by `PrefetchState`) so it
+    /// drops when `ReqwestSource` drops, even if workers still hold
+    /// `Arc<PrefetchState>` references. Without this split, workers would
+    /// hold the only `Arc<PrefetchState>` refs forever (deadlock) since
+    /// `cancel_tx` would never drop.
+    cancel_tx: std::sync::OnceLock<tokio::sync::watch::Sender<bool>>,
 }
 
 #[cfg(feature = "default-source")]
@@ -146,6 +156,7 @@ impl Clone for ReqwestSource {
             // Each clone gets its own (lazily-initialized) prefetch state.
             // Clones are independent — they do not share prefetch caches.
             state: std::sync::OnceLock::new(),
+            cancel_tx: std::sync::OnceLock::new(),
         }
     }
 }
@@ -159,6 +170,7 @@ impl ReqwestSource {
             http: reqwest::Client::new(),
             concurrency: 1,
             state: std::sync::OnceLock::new(),
+            cancel_tx: std::sync::OnceLock::new(),
         }
     }
 
@@ -169,6 +181,7 @@ impl ReqwestSource {
             http,
             concurrency: 1,
             state: std::sync::OnceLock::new(),
+            cancel_tx: std::sync::OnceLock::new(),
         }
     }
 
@@ -180,6 +193,7 @@ impl ReqwestSource {
             http: reqwest::Client::new(),
             concurrency: concurrency.max(1),
             state: std::sync::OnceLock::new(),
+            cancel_tx: std::sync::OnceLock::new(),
         }
     }
 
@@ -192,6 +206,7 @@ impl ReqwestSource {
             http,
             concurrency: concurrency.max(1),
             state: std::sync::OnceLock::new(),
+            cancel_tx: std::sync::OnceLock::new(),
         }
     }
 
@@ -260,17 +275,75 @@ impl Source for ReqwestSource {
                     apply_range(bytes, range)
                 }
                 SourceLocation::Url(url) => {
-                    // Check the prefetch cache first. If there's a slot for
-                    // this (url, range), wait for it and return the bytes.
-                    // The MutexGuard is dropped at the end of the block so it
-                    // doesn't cross the await boundary (MutexGuard is !Send).
-                    let cached = self.state.get().map(|state| {
+                    // Fast path: prefetch slot exists for this (url, range).
+                    // Wait for it to become Ready, take the bytes, evict.
+                    if let Some(state_ref) = self.state.get() {
+                        let state = std::sync::Arc::clone(state_ref);
                         let key = (url.clone(), range.copied());
-                        let slot = { state.slots.lock().unwrap().get(&key).cloned() };
-                        (state, key, slot)
-                    });
-                    if let Some((state, key, Some(slot))) = cached {
-                        return read_from_slot(state.clone(), &key, &slot).await;
+                        // Try the cache first — MutexGuard is dropped before
+                        // the await boundary (MutexGuard is !Send).
+                        let cached_slot = {
+                            state.slots.lock().unwrap().get(&key).cloned()
+                        };
+                        if let Some(slot) = cached_slot {
+                            return read_from_slot(state, &key, &slot).await;
+                        }
+                        // Slow path: consumer raced ahead of prefetch (no
+                        // slot exists yet). Use the Entry API to atomically
+                        // either grab a worker-spawned InFlight slot (raced
+                        // with a worker between our cache miss and the lock)
+                        // or self-build one with `_buffer_permit = None` and
+                        // spawn a one-shot fetch. This avoids redundant
+                        // direct-fetch bandwidth competing with workers.
+                        let slot = {
+                            let mut slots = state.slots.lock().unwrap();
+                            match slots.entry(key.clone()) {
+                                std::collections::hash_map::Entry::Occupied(e) => {
+                                    // A worker inserted between our cache miss
+                                    // and this lock acquisition — use its slot.
+                                    e.get().clone()
+                                }
+                                std::collections::hash_map::Entry::Vacant(v) => {
+                                    // Self-build a slot. Permit is None so it
+                                    // doesn't count against `buffer_sem`.
+                                    let slot = std::sync::Arc::new(Slot {
+                                        state: tokio::sync::Mutex::new(SlotState::InFlight),
+                                        notify: tokio::sync::Notify::new(),
+                                        _buffer_permit: None,
+                                    });
+                                    v.insert(std::sync::Arc::clone(&slot));
+                                    // Spawn one-shot fetch using the cloned
+                                    // http client — `state` is not captured.
+                                    let http = state.http.clone();
+                                    let fetch_url = url.clone();
+                                    let fetch_range = range.copied();
+                                    let fetch_slot = std::sync::Arc::clone(&slot);
+                                    tokio::spawn(async move {
+                                        let result = fetch_bytes_with_range(
+                                            &http,
+                                            &fetch_url,
+                                            fetch_range.as_ref(),
+                                        )
+                                        .await;
+                                        let mut s = fetch_slot.state.lock().await;
+                                        match result {
+                                            Ok(bytes) => {
+                                                *s = SlotState::Ready(
+                                                    std::sync::Arc::new(bytes),
+                                                );
+                                            }
+                                            Err(e) => {
+                                                *s = SlotState::Failed(e.to_string());
+                                            }
+                                        }
+                                        drop(s);
+                                        fetch_slot.notify.notify_waiters();
+                                    });
+                                    slot
+                                }
+                            }
+                        };
+                        return read_from_slot(state, &key, &slot).await;
                     }
                     // Fall through: init segment, URL not in prefetch list,
                     // or concurrency == 1 (state never initialized).
@@ -393,12 +466,21 @@ fn apply_range(bytes: Vec<u8>, range: Option<&ByteRange>) -> Result<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // Concurrent download infrastructure (only compiled with `default-source`).
 //
-// Design: "bounded slot cache" — a counting semaphore (mpsc channel) bounds
-// the number of outstanding (in-flight + ready-but-unconsumed) segment
-// downloads. The coordinator pops targets in playlist order and spawns a
-// fetch task per target. Consumers (`read_bytes`) look up the slot by
-// (Url, Option<ByteRange>), wait for it to become Ready via `Notify`, take
-// the bytes, return the token, and evict the slot.
+// Design: "worker + buffer_sem(3N) + consumer self-built slot" — N workers
+// pop targets from a shared queue and fetch concurrently; a
+// `Semaphore(concurrency * 3)` bounds total outstanding slots (InFlight +
+// Ready-unconsumed) to 3N, matching v1 `semaphore(N) + channel(2N) = 3N`
+// backpressure. Each worker stores its `OwnedSemaphorePermit` inside the
+// slot it creates; the permit is released when the consumer drops the slot
+// after reading.
+//
+// When the consumer (transmuxer) races ahead of prefetch — i.e. calls
+// `read_bytes` for a target no worker has reached yet — it self-builds a
+// slot with `_buffer_permit = None` and spawns a one-shot fetch. Workers
+// popping that target later see an existing slot and skip it (releasing
+// their freshly-acquired buffer_permit). This mirrors v1's "consumer waits
+// on `rx.recv()` when channel is empty" semantics and avoids redundant
+// downloads competing for bandwidth.
 //
 // Why not BTreeMap by index? The Source trait API is URL-based, not
 // index-based. The transmuxer already consumes segments in playlist order,
@@ -410,18 +492,22 @@ type SlotKey = (Url, Option<ByteRange>);
 
 #[cfg(feature = "default-source")]
 struct PrefetchState {
-    /// Consumer side of the counting semaphore. The coordinator holds the
-    /// `Receiver` and `recv()`s one token per spawned fetch. Consumers
-    /// `send(())` a token back after reading (or failing to read) a slot.
-    tokens_tx: tokio::sync::mpsc::Sender<()>,
     /// URL+range → slot. `std::sync::Mutex` because critical sections are
     /// tiny (insert / lookup / evict) and never await.
     slots: std::sync::Mutex<HashMap<SlotKey, std::sync::Arc<Slot>>>,
     /// Ordered queue of (Url, Option<ByteRange>) targets to prefetch.
-    /// The coordinator pops from the front; consumers never touch this.
+    /// Workers pop from the front; consumers never touch this except for
+    /// the consumer-self-built-slot fast path, which uses `slots` not
+    /// `targets`.
     targets: std::sync::Mutex<std::collections::VecDeque<SlotKey>>,
     /// Shared HTTP client (clone is cheap — internally `Arc`).
     http: reqwest::Client,
+    /// Buffer semaphore: bounds total outstanding slots (InFlight +
+    /// Ready-unconsumed) to `concurrency * 3`. Workers acquire_owned() a
+    /// permit before fetching; the permit is stored in the slot and
+    /// released when the consumer drops the slot. This matches v1's
+    /// `semaphore(N) in-flight + channel(2N) buffered = 3N` backpressure.
+    buffer_sem: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 #[cfg(feature = "default-source")]
@@ -430,6 +516,11 @@ struct Slot {
     state: tokio::sync::Mutex<SlotState>,
     /// Efficient zero-poll wakeup for consumers waiting on InFlight → Ready.
     notify: tokio::sync::Notify,
+    /// Worker-created slots hold `Some(permit)` so the buffer semaphore
+    /// releases when the consumer drops the slot. Consumer-self-built
+    /// slots hold `None` — they don't count against `buffer_sem` (at most
+    /// one such slot exists per pending target).
+    _buffer_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 #[cfg(feature = "default-source")]
@@ -482,88 +573,119 @@ impl ReqwestSource {
         // Lazy-init the prefetch state. `get_or_init` only runs once; if
         // `read_text` was called before (e.g. master playlist), the earlier
         // call would have returned early and left `state` uninitialized.
-        self.state.get_or_init(|| {
-            let (tokens_tx, tokens_rx) = tokio::sync::mpsc::channel(self.concurrency);
-            let state = std::sync::Arc::new(PrefetchState {
-                tokens_tx: tokens_tx.clone(),
+        //
+        // `cancel_tx` is held by `self` (NOT by `PrefetchState`) so that
+        // dropping `ReqwestSource` drops the Sender — workers see
+        // `cancel_rx.changed()` return Err and exit. If `cancel_tx` lived
+        // inside `PrefetchState`, workers would hold the only `Arc` refs
+        // forever (deadlock: PrefetchState won't drop until workers exit,
+        // but workers won't exit until cancel_tx drops).
+        let cancel_tx = self.cancel_tx.get_or_init(|| tokio::sync::watch::channel(false).0);
+        let cancel_rx = cancel_tx.subscribe();
+        let state = self.state.get_or_init(|| {
+            std::sync::Arc::new(PrefetchState {
                 slots: std::sync::Mutex::new(HashMap::new()),
                 targets: std::sync::Mutex::new(targets),
                 http: self.http.clone(),
-            });
-
-            // Prefill the semaphore with `concurrency` tokens. The
-            // coordinator will `recv()` one token before each fetch, and
-            // consumers will `send(())` one back after consuming a slot.
-            // This bounds outstanding slots (InFlight + Ready-unconsumed)
-            // to `concurrency`.
-            for _ in 0..self.concurrency {
-                let _ = tokens_tx.try_send(());
-            }
-
-            // Spawn the coordinator. It runs until the target queue is
-            // empty or all tokens are dropped (on `ReqwestSource` drop,
-            // the `Sender` clones are dropped, `recv()` returns `None`).
-            let state_clone = std::sync::Arc::clone(&state);
-            tokio::spawn(prefetch_coordinator(state_clone, tokens_rx));
-
-            state
+                buffer_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    self.concurrency * 3,
+                )),
+            })
         });
+
+        // Spawn N workers. Each worker loops independently: pop target
+        // → acquire buffer_permit → fetch → store slot → continue.
+        // Workers stop when targets is empty OR cancel_tx is dropped
+        // (i.e. ReqwestSource is dropped).
+        for _ in 0..self.concurrency {
+            tokio::spawn(prefetch_worker(
+                std::sync::Arc::clone(state),
+                cancel_rx.clone(),
+            ));
+        }
     }
 }
 
-/// Coordinator: pops targets in order, waits for a token (backpressure),
-/// spawns a fetch task per target. Runs concurrently with consumers.
+/// Worker: pops targets in order, acquires a buffer permit (backpressure),
+/// fetches the segment, stores the result in a slot. Runs concurrently
+/// with other workers and with consumers. Exits when the target queue is
+/// empty or the cancel signal fires.
 #[cfg(feature = "default-source")]
-async fn prefetch_coordinator(
+async fn prefetch_worker(
     state: std::sync::Arc<PrefetchState>,
-    mut tokens_rx: tokio::sync::mpsc::Receiver<()>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
-        // Block until a token is available. Returns None when all Sender
-        // clones are dropped (i.e. the ReqwestSource was dropped) — then
-        // stop the coordinator.
-        if tokens_rx.recv().await.is_none() {
+        // Fast cancel check: if cancel_tx was dropped (returns Err) or
+        // the flag flipped to true, stop the worker.
+        if *cancel_rx.borrow() {
             return;
         }
-
-        // Pop the next target. If the queue is empty, the prefetch is
-        // complete — return the token and stop.
+        // Pop the next target. Empty queue → prefetch complete → exit.
         let target = state.targets.lock().unwrap().pop_front();
         let Some((url, range)) = target else {
             return;
         };
 
-        // Register an InFlight slot before spawning the fetch, so the
-        // consumer can find it immediately if `read_bytes` races ahead.
-        let slot = std::sync::Arc::new(Slot {
-            state: tokio::sync::Mutex::new(SlotState::InFlight),
-            notify: tokio::sync::Notify::new(),
-        });
-        state
-            .slots
-            .lock()
-            .unwrap()
-            .insert((url.clone(), range), std::sync::Arc::clone(&slot));
-
-        // Spawn the fetch task. It runs concurrently with other fetches
-        // and with the coordinator (which loops back to recv() the next
-        // token, blocking if `concurrency` slots are already outstanding).
-        let http = state.http.clone();
-        tokio::spawn(async move {
-            let result = fetch_bytes_with_range(&http, &url, range.as_ref()).await;
-            let mut s = slot.state.lock().await;
-            match result {
-                Ok(bytes) => *s = SlotState::Ready(std::sync::Arc::new(bytes)),
-                Err(e) => *s = SlotState::Failed(e.to_string()),
+        // Acquire a buffer permit before fetching. This blocks when total
+        // outstanding slots reach `concurrency * 3`, providing backpressure
+        // until the consumer frees a slot. Race against cancel so we don't
+        // hang forever if the source is dropped while waiting.
+        let buffer_permit = tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => return,
+            permit = state.buffer_sem.clone().acquire_owned() => {
+                match permit {
+                    Ok(p) => p,
+                    Err(_) => return, // Semaphore closed (shouldn't happen)
+                }
             }
-            drop(s);
-            slot.notify.notify_waiters();
-        });
+        };
+
+        // Race: if the consumer already self-built a slot for this target
+        // (it caught up to prefetch front), skip — drop the buffer_permit
+        // to release the semaphore slot. Use Entry API for atomic insert.
+        let slot = {
+            let mut slots = state.slots.lock().unwrap();
+            match slots.entry((url.clone(), range)) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    // Consumer got here first. Drop buffer_permit and
+                    // continue to next target.
+                    drop(buffer_permit);
+                    continue;
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    let slot = std::sync::Arc::new(Slot {
+                        state: tokio::sync::Mutex::new(SlotState::InFlight),
+                        notify: tokio::sync::Notify::new(),
+                        _buffer_permit: Some(buffer_permit),
+                    });
+                    v.insert(std::sync::Arc::clone(&slot));
+                    slot
+                }
+            }
+        };
+
+        // Fetch the bytes. Don't hold any locks across the await.
+        let http = state.http.clone();
+        let result = fetch_bytes_with_range(&http, &url, range.as_ref()).await;
+
+        // Store the result and wake any waiting consumers.
+        let mut s = slot.state.lock().await;
+        match result {
+            Ok(bytes) => *s = SlotState::Ready(std::sync::Arc::new(bytes)),
+            Err(e) => *s = SlotState::Failed(e.to_string()),
+        }
+        drop(s);
+        slot.notify.notify_waiters();
+        // Loop back to pop the next target — don't wait for the consumer!
     }
 }
 
 /// Consumer side: wait for the slot to become Ready (or Failed), extract
-/// the bytes, return the token to the semaphore, and evict the slot.
+/// the bytes, and evict the slot. Eviction drops the `Arc<Slot>`; if this
+/// is the last strong reference, the slot's `_buffer_permit` is dropped,
+/// releasing the buffer semaphore and unblocking a waiting worker.
 #[cfg(feature = "default-source")]
 async fn read_from_slot(
     state: std::sync::Arc<PrefetchState>,
@@ -583,19 +705,18 @@ async fn read_from_slot(
             SlotState::Ready(bytes) => {
                 let bytes = (**bytes).clone();
                 drop(s);
-                // Return the token so the coordinator can spawn the next
-                // fetch. Evict the slot to free memory.
-                let _ = state.tokens_tx.try_send(());
+                // Evict the slot. The Arc<Slot> returned by `remove` will
+                // drop at end of scope, releasing the buffer_permit (if
+                // any) and freeing memory.
                 state.slots.lock().unwrap().remove(key);
                 return Ok(bytes);
             }
             SlotState::Failed(msg) => {
                 let msg = msg.clone();
                 drop(s);
-                // Return the token even on failure — the worker consumed
-                // a token but didn't produce consumable bytes. Without
-                // this, a Failed slot would permanently leak a token.
-                let _ = state.tokens_tx.try_send(());
+                // Evict even on failure — the worker consumed a permit but
+                // didn't produce consumable bytes. Releasing the permit
+                // lets another worker fetch the next target.
                 state.slots.lock().unwrap().remove(key);
                 return Err(Error::Http(msg));
             }

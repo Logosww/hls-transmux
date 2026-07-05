@@ -133,7 +133,7 @@ let report = transmux_hls_to_mp4_async(
 # }
 ```
 
-**内存有界**：mpsc channel 作为计数信号量，outstanding（InFlight + Ready-unconsumed）分片数 ≤ `concurrency`。消费侧（`read_bytes`）取出字节后归还 token，coordinator 才会 spawn 下一个 fetch。与 `StreamingMp4` 低内存 pipeline 协同友好。
+**v3 worker 模型**：N 个 worker 并发 pop target + fetch + store slot，`buffer_sem = concurrency * 3` 限制总 outstanding（InFlight + Ready-unconsumed）slots ≤ 3N，对齐 `semaphore(N) in-flight + channel(2N) buffered = 3N` 反压水位。worker 的 `OwnedSemaphorePermit` 存入 `Slot._buffer_permit`，consumer drop slot 时释放。当 consumer 追上 prefetch 前沿（slot 不存在）时，用 `Entry` API 自建 slot（`_buffer_permit: None`，不计入 buffer_sem）+ spawn 一次性 fetch；worker pop 到该 target 时检测到 `Occupied` 即 skip 并释放自己的 permit，避免冗余下载竞争带宽。
 
 **触发条件**：
 - `concurrency > 1`
@@ -143,6 +143,8 @@ let report = transmux_hls_to_mp4_async(
 **透明性**：transmuxer 仍按 `segments[i]` 顺序调用 `read_bytes(url)`，并发预取对 transmux 逻辑完全透明 —— 字节可能已在 slot cache 中，也可能需要等 fetch 完成。`concurrency = 1` 走原串行路径，零开销。
 
 `HlsInput::Url` / `HlsInput::Path` 不变（仍用 `ReqwestSource::new()`，串行）；并发用户通过 `HlsInput::custom` 显式传入 `ReqwestSource::with_concurrency(n)` 启用。
+
+详见 [docs/PHASE 5.md](file:///Users/wangzhili/Desktop/Native/hls-transmux/docs/PHASE%205.md)。
 
 ## 进度回调 / 取消 / 续传
 
