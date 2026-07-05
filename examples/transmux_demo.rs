@@ -6,14 +6,16 @@
 //! Arguments:
 //!     playlist-url-or-path = HLS playlist URL (http/https) or local path (required)
 //!     output               = ./output.mp4 (or ./output.fmp4 with --fragmented)
-//!     variant-index        = 0 (positional, backward compat; overridden by --variant)
+//!     variant-index        = optional positional (backward compat; overridden by --variant).
+//!                           When absent, defaults to `HighestBandwidth`.
 //!
 //! Flags:
 //!     --fragmented      = write fragmented MP4 (ftyp + moov + moof/mdat per segment)
-//!     --streaming       = streaming fMP4 pipeline + finalize to standard MP4
+//!     --streaming       = alias for the default `StreamingMp4` pipeline (no-op;
+//!                         kept for backwards-compatible CLI usage)
 //!     --ffmpeg-finalize = with --streaming, finalize via ffmpeg instead of the
 //!                         built-in defrag path. Requires `--features ffmpeg-finalize`.
-//!     --concurrency <n> = concurrent segment prefetch (default 1 = sequential;
+//!     --concurrency <n> = concurrent segment prefetch (default 4;
 //!                         only effective for HTTP URLs). Requires `default-source`.
 //!     --variant <v>     = variant selection: `highest`, `lowest`, or a numeric
 //!                         index (overrides positional variant-index).
@@ -32,8 +34,10 @@ use {
 async fn main() -> hls_transmux::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Parse flags that take a value: --concurrency <n>, --variant <v>
-    let mut concurrency: usize = 1;
+    // Parse flags that take a value: --concurrency <n>, --variant <v>.
+    // Concurrency defaults to 4 (only effective for HTTP URLs; local files
+    // are always sequential regardless of this value).
+    let mut concurrency: usize = 4;
     let mut variant_flag: Option<String> = None;
     let mut remaining: Vec<&String> = Vec::new();
     let mut iter = args.iter().peekable();
@@ -58,7 +62,10 @@ async fn main() -> hls_transmux::Result<()> {
     }
 
     let fragmented = remaining.iter().any(|a| **a == "--fragmented");
-    let streaming = remaining.iter().any(|a| **a == "--streaming");
+    // `--streaming` is now a no-op alias (StreamingMp4 is the default).
+    // Kept for backwards-compatible CLI usage; the flag is parsed but
+    // intentionally unused.
+    let _streaming = remaining.iter().any(|a| **a == "--streaming");
     let ffmpeg_finalize_flag = remaining.iter().any(|a| **a == "--ffmpeg-finalize");
     let positional: Vec<&String> = remaining
         .iter()
@@ -96,7 +103,10 @@ async fn main() -> hls_transmux::Result<()> {
             }
         });
 
-    // Resolve variant selection: --variant flag takes precedence over positional index.
+    // Resolve variant selection: `--variant` flag takes precedence over the
+    // positional `<variant-index>` (3rd arg, backward compat). When neither
+    // is provided, default to `HighestBandwidth` (matches the common "best
+    // quality" expectation for a demo).
     let variant: VariantSelection = if let Some(v) = &variant_flag {
         match v.as_str() {
             "highest" => VariantSelection::HighestBandwidth,
@@ -106,20 +116,23 @@ async fn main() -> hls_transmux::Result<()> {
                     .map_err(|_| hls_transmux::Error::invalid("--variant must be `highest`, `lowest`, or a numeric index"))?,
             ),
         }
+    } else if let Some(idx) = positional.get(2) {
+        VariantSelection::Index(
+            idx.parse()
+                .expect("variant-index must be a number"),
+        )
     } else {
-        let variant_index: usize = positional
-            .get(2)
-            .map(|s| s.parse().expect("variant-index must be a number"))
-            .unwrap_or(0);
-        VariantSelection::Index(variant_index)
+        VariantSelection::HighestBandwidth
     };
 
+    // Output format selection. Default is `StreamingMp4` (streaming fMP4
+    // pipeline + end defrag → standard MP4, lower peak memory); `--fragmented`
+    // opts into fMP4 output directly; `--streaming` is kept as an explicit
+    // alias for the default for backwards-compatible CLI usage.
     let format = if fragmented {
         OutputFormat::FragmentedMp4
-    } else if streaming {
-        OutputFormat::StreamingMp4
     } else {
-        OutputFormat::Mp4
+        OutputFormat::StreamingMp4
     };
 
     #[cfg(feature = "ffmpeg-finalize")]
