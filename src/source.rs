@@ -96,6 +96,40 @@ pub trait Source: Send + Sync + std::fmt::Debug {
 /// `reqwest::Client` (e.g. with proxies, custom TLS, retry policies) and pass
 /// it to [`ReqwestSource::with_client`].
 ///
+/// # Custom request headers (auth, cookies, etc.)
+///
+/// Use [`ReqwestSource::with_headers`] or
+/// [`ReqwestSource::with_concurrency_and_headers`] to attach a
+/// `reqwest::header::HeaderMap` to every outbound request (playlist `GET`s
+/// and segment `GET`s, including Range requests). The headers are applied to
+/// both the sequential path and the v3 concurrent prefetch workers. Typical
+/// use cases: `Authorization: Bearer <token>`, `Cookie: ...`, `Origin: ...`,
+/// custom CDN signing headers.
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use hls_transmux::{HlsInput, ReqwestSource, SourceLocation};
+/// use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+///
+/// let mut headers = HeaderMap::new();
+/// headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+/// let source = Arc::new(ReqwestSource::with_concurrency_and_headers(4, headers));
+/// let location = SourceLocation::Url(
+///     url::Url::parse("https://example.com/media.m3u8").unwrap()
+/// );
+/// // source now sends Authorization on both playlist and segment requests
+/// let _input = HlsInput::custom(source, location);
+/// ```
+///
+/// Note: if you also pass a custom `reqwest::Client` (via
+/// [`ReqwestSource::with_client`] /
+/// [`ReqwestSource::with_client_and_concurrency`]), prefer setting default
+/// headers on the client itself via
+/// `reqwest::ClientBuilder::default_headers` — the `headers` field on
+/// `ReqwestSource` is for the no-custom-client case. The two layers
+/// compose: client default headers + per-source `headers` are both applied
+/// (per-source overrides client defaults for the same header name).
+///
 /// # Concurrent segment downloads
 ///
 /// By default `ReqwestSource` downloads segments sequentially. To enable
@@ -117,6 +151,11 @@ pub trait Source: Send + Sync + std::fmt::Debug {
 pub struct ReqwestSource {
     http: reqwest::Client,
     concurrency: usize,
+    /// Headers applied to every outbound HTTP request (playlist + segment,
+    /// sequential + concurrent). Cloned into `PrefetchState` on prefetch init
+    /// so workers apply the same headers. `HeaderMap::clone` is cheap
+    /// (internally `Arc`-shared until mutation).
+    headers: reqwest::header::HeaderMap,
     /// Lazy prefetch state, initialized on the first `read_text` that returns
     /// a media playlist (when `concurrency > 1`). `OnceLock` is used because
     /// `read_text` may be called twice (master → variant) and only the variant
@@ -153,6 +192,7 @@ impl Clone for ReqwestSource {
         Self {
             http: self.http.clone(),
             concurrency: self.concurrency,
+            headers: self.headers.clone(),
             // Each clone gets its own (lazily-initialized) prefetch state.
             // Clones are independent — they do not share prefetch caches.
             state: std::sync::OnceLock::new(),
@@ -169,6 +209,7 @@ impl ReqwestSource {
         Self {
             http: reqwest::Client::new(),
             concurrency: 1,
+            headers: reqwest::header::HeaderMap::new(),
             state: std::sync::OnceLock::new(),
             cancel_tx: std::sync::OnceLock::new(),
         }
@@ -180,6 +221,7 @@ impl ReqwestSource {
         Self {
             http,
             concurrency: 1,
+            headers: reqwest::header::HeaderMap::new(),
             state: std::sync::OnceLock::new(),
             cancel_tx: std::sync::OnceLock::new(),
         }
@@ -192,6 +234,7 @@ impl ReqwestSource {
         Self {
             http: reqwest::Client::new(),
             concurrency: concurrency.max(1),
+            headers: reqwest::header::HeaderMap::new(),
             state: std::sync::OnceLock::new(),
             cancel_tx: std::sync::OnceLock::new(),
         }
@@ -205,6 +248,48 @@ impl ReqwestSource {
         Self {
             http,
             concurrency: concurrency.max(1),
+            headers: reqwest::header::HeaderMap::new(),
+            state: std::sync::OnceLock::new(),
+            cancel_tx: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Creates a new `ReqwestSource` with a default `reqwest::Client`,
+    /// sequential downloads, and the given `headers` attached to every
+    /// outbound HTTP request (playlist `GET`s and segment `GET`s).
+    ///
+    /// Typical use: `Authorization: Bearer <token>`, `Cookie: ...`, custom
+    /// CDN signing headers. See the type-level doc for an example.
+    ///
+    /// To combine a custom `reqwest::Client` with headers, build the client
+    /// via `reqwest::ClientBuilder::default_headers(headers)` and pass it to
+    /// [`Self::with_client`] / [`Self::with_client_and_concurrency`].
+    pub fn with_headers(headers: reqwest::header::HeaderMap) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            concurrency: 1,
+            headers,
+            state: std::sync::OnceLock::new(),
+            cancel_tx: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Creates a new `ReqwestSource` with a default `reqwest::Client`,
+    /// concurrent segment prefetch enabled, and the given `headers` attached
+    /// to every outbound HTTP request. `concurrency` is clamped to a minimum
+    /// of 1; values ≤ 1 disable prefetch.
+    ///
+    /// Equivalent to [`Self::with_concurrency`] but with custom request
+    /// headers. Headers are propagated to both the consumer-facing
+    /// `read_text`/`read_bytes` and the v3 prefetch workers.
+    pub fn with_concurrency_and_headers(
+        concurrency: usize,
+        headers: reqwest::header::HeaderMap,
+    ) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            concurrency: concurrency.max(1),
+            headers,
             state: std::sync::OnceLock::new(),
             cancel_tx: std::sync::OnceLock::new(),
         }
@@ -213,6 +298,13 @@ impl ReqwestSource {
     /// Returns the configured concurrency level (1 = sequential).
     pub fn concurrency(&self) -> usize {
         self.concurrency
+    }
+
+    /// Returns a reference to the headers applied to every outbound HTTP
+    /// request. Empty by default unless set via [`Self::with_headers`] or
+    /// [`Self::with_concurrency_and_headers`].
+    pub fn headers(&self) -> &reqwest::header::HeaderMap {
+        &self.headers
     }
 }
 
@@ -232,9 +324,11 @@ impl Source for ReqwestSource {
                     }
                 }
                 SourceLocation::Url(url) => {
-                    let response = self
-                        .http
-                        .get(url.clone())
+                    let mut request = self.http.get(url.clone());
+                    if !self.headers.is_empty() {
+                        request = request.headers(self.headers.clone());
+                    }
+                    let response = request
                         .send()
                         .await
                         .map_err(|e| Error::Http(e.to_string()))?;
@@ -313,14 +407,18 @@ impl Source for ReqwestSource {
                                     });
                                     v.insert(std::sync::Arc::clone(&slot));
                                     // Spawn one-shot fetch using the cloned
-                                    // http client — `state` is not captured.
+                                    // http client + headers — `state` is not
+                                    // captured (avoid holding an Arc into the
+                                    // one-shot task).
                                     let http = state.http.clone();
+                                    let headers = state.headers.clone();
                                     let fetch_url = url.clone();
                                     let fetch_range = range.copied();
                                     let fetch_slot = std::sync::Arc::clone(&slot);
                                     tokio::spawn(async move {
                                         let result = fetch_bytes_with_range(
                                             &http,
+                                            &headers,
                                             &fetch_url,
                                             fetch_range.as_ref(),
                                         )
@@ -347,7 +445,7 @@ impl Source for ReqwestSource {
                     }
                     // Fall through: init segment, URL not in prefetch list,
                     // or concurrency == 1 (state never initialized).
-                    fetch_bytes_with_range(&self.http, url, range).await
+                    fetch_bytes_with_range(&self.http, &self.headers, url, range).await
                 }
             }
         })
@@ -502,6 +600,11 @@ struct PrefetchState {
     targets: std::sync::Mutex<std::collections::VecDeque<SlotKey>>,
     /// Shared HTTP client (clone is cheap — internally `Arc`).
     http: reqwest::Client,
+    /// Headers applied to every worker fetch (cloned from `ReqwestSource`).
+    /// Workers read this without mutation, so no `Mutex` needed. The
+    /// consumer-self-built-slot path also clones this for its one-shot
+    /// fetch task.
+    headers: reqwest::header::HeaderMap,
     /// Buffer semaphore: bounds total outstanding slots (InFlight +
     /// Ready-unconsumed) to `concurrency * 3`. Workers acquire_owned() a
     /// permit before fetching; the permit is stored in the slot and
@@ -587,6 +690,7 @@ impl ReqwestSource {
                 slots: std::sync::Mutex::new(HashMap::new()),
                 targets: std::sync::Mutex::new(targets),
                 http: self.http.clone(),
+                headers: self.headers.clone(),
                 buffer_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
                     self.concurrency * 3,
                 )),
@@ -668,7 +772,8 @@ async fn prefetch_worker(
 
         // Fetch the bytes. Don't hold any locks across the await.
         let http = state.http.clone();
-        let result = fetch_bytes_with_range(&http, &url, range.as_ref()).await;
+        let headers = state.headers.clone();
+        let result = fetch_bytes_with_range(&http, &headers, &url, range.as_ref()).await;
 
         // Store the result and wake any waiting consumers.
         let mut s = slot.state.lock().await;
@@ -724,24 +829,38 @@ async fn read_from_slot(
     }
 }
 
-/// Fetches bytes from `url` with an optional Range request. Extracted from
-/// the original `read_bytes` URL branch so it can be shared by the sequential
-/// path (`read_bytes` fallthrough) and the concurrent fetch tasks.
+/// Fetches bytes from `url` with an optional Range request, applying the
+/// given `headers` to the outbound request. Extracted from the original
+/// `read_bytes` URL branch so it can be shared by the sequential path
+/// (`read_bytes` fallthrough), the v3 prefetch workers, and the consumer
+/// self-built-slot one-shot fetch.
+///
+/// Header precedence: caller-supplied `headers` are applied first; if the
+/// caller also passed a `range`, the `Range` header is set explicitly
+/// afterwards (via `RequestBuilder::header`, which uses `HeaderMap::insert`
+/// and replaces any `Range` set by the caller). Callers should not set
+/// `Range` in `headers` — let the `range` parameter drive it.
 #[cfg(feature = "default-source")]
 async fn fetch_bytes_with_range(
     http: &reqwest::Client,
+    headers: &reqwest::header::HeaderMap,
     url: &Url,
     range: Option<&ByteRange>,
 ) -> Result<Vec<u8>> {
     use reqwest::header::{CONTENT_RANGE, RANGE};
 
     let mut request = http.get(url.clone());
+    if !headers.is_empty() {
+        request = request.headers(headers.clone());
+    }
     if let Some(range) = range {
         let end = range
             .offset
             .checked_add(range.length)
             .and_then(|value| value.checked_sub(1))
             .ok_or_else(|| Error::invalid("HTTP byterange overflows u64"))?;
+        // `header()` uses HeaderMap::insert → replaces any `Range` the
+        // caller may have set in `headers`. Desired: `range` param wins.
         request = request.header(RANGE, format!("bytes={}-{}", range.offset, end));
     }
 

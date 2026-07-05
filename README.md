@@ -161,6 +161,42 @@ transmux 逻辑完全透明 —— 字节可能已在 slot cache 中，也可能
 `ReqwestSource::new()`，串行）；并发用户通过 `HlsInput::custom` 显式传入
 `ReqwestSource::with_concurrency(n)` 启用。
 
+### 自定义请求头（鉴权 / Cookie / CDN 签名）
+
+需要访问受保护资源时（如 `Authorization: Bearer <token>`、`Cookie`、自定义
+CDN 签名头），用 [`ReqwestSource::with_headers`] 或
+[`ReqwestSource::with_concurrency_and_headers`] 传入 `reqwest::header::HeaderMap`。
+headers 会附加到**所有**出站 HTTP 请求（playlist `GET` + segment `GET`，含
+Range 请求），sequential 与 v3 并发路径均生效。
+
+```rust
+use std::sync::Arc;
+use hls_transmux::{
+    HlsInput, ReqwestSource, SourceLocation, TransmuxOptions, transmux_hls_to_mp4_async,
+};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+
+# async fn run() -> hls_transmux::Result<()> {
+let mut headers = HeaderMap::new();
+headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+let source = Arc::new(ReqwestSource::with_concurrency_and_headers(4, headers));
+let location = SourceLocation::Url(
+    url::Url::parse("https://example.com/media.m3u8").unwrap()
+);
+let _ = transmux_hls_to_mp4_async(
+    HlsInput::custom(source, location),
+    "output.fmp4",
+    TransmuxOptions::default(),
+).await?;
+# Ok(())
+# }
+```
+
+`headers()` accessor 可读取已配置的 `HeaderMap`。需要同时使用 custom
+`reqwest::Client` + headers 时，用
+`reqwest::ClientBuilder::default_headers(headers)` 构造 client，再传给
+[`ReqwestSource::with_client`] / [`ReqwestSource::with_client_and_concurrency`]。
+
 ## 进度回调 / 取消 / 续传
 
 `TransmuxOptions` 提供三个可选钩子，均默认
