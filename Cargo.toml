@@ -1,9 +1,9 @@
 [package]
 name = "hls-transmux"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A small, dependency-light HLS → MP4 transmuxer for Rust (TS/fMP4 in, MP4/CMAF out)."
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/Logosww/hls-transmux"
 homepage = "https://github.com/Logosww/hls-transmux"
 readme = "README.md"
