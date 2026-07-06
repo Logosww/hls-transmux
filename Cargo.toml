@@ -1,12 +1,15 @@
 [package]
 name = "hls-transmux"
-version = "0.1.0-alpha.6"
+version = "0.1.0"
 edition = "2024"
 description = "A small, dependency-light HLS → MP4 transmuxer for Rust (TS/fMP4 in, MP4/CMAF out)."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Logosww/hls-transmux"
+homepage = "https://github.com/Logosww/hls-transmux"
+readme = "README.md"
 keywords = ["hls", "mp4", "transmux", "cmaf", "isobmff"]
 categories = ["multimedia::video", "multimedia"]
-exclude = ["/docs", "/.trae", "/target"]
+exclude = ["/docs", "/target"]
 
 [features]
 default = ["default-source"]
