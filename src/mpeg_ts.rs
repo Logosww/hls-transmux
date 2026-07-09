@@ -88,16 +88,43 @@ pub(crate) fn demux_ts(data: &[u8]) -> Result<DemuxOutput> {
         };
 
         if payload_unit_start {
-            if let Some(accumulator) = accumulators.remove(&pid) {
-                flush_pes(accumulator, &mut result)?;
+            // For video streams (AVC/HEVC), a new PES packet may be a
+            // continuation of a NAL unit that was split across PES packets.
+            // This happens when a large access unit (e.g. an IDR frame)
+            // exceeds the PES packet size. The continuation PES packet's
+            // elementary-stream payload does NOT start with an Annex B start
+            // code (00 00 01 / 00 00 00 01) — it is raw NAL data that should
+            // be appended to the previous accumulator to complete the NAL
+            // unit. Without this, the continuation payload is dropped by
+            // `nal_units_annex_b` (which finds no start codes), truncating
+            // the NAL unit and corrupting the H.264/HEVC bitstream.
+            let is_video = matches!(kind, StreamKind::Avc | StreamKind::Hevc);
+            let is_continuation = is_video
+                && accumulators.contains_key(&pid)
+                && pes_starts_new_access_unit(payload) == Some(false);
+
+            if is_continuation {
+                // Append the ES payload (after the PES header) to the previous
+                // accumulator. The PES header (PTS/DTS) of the continuation is
+                // discarded — the access unit's timestamp comes from the first
+                // PES packet.
+                let header_data_length = payload[8] as usize;
+                let es_start = 9 + header_data_length;
+                if let Some(accumulator) = accumulators.get_mut(&pid) {
+                    accumulator.data.extend_from_slice(&payload[es_start..]);
+                }
+            } else {
+                if let Some(accumulator) = accumulators.remove(&pid) {
+                    flush_pes(accumulator, &mut result)?;
+                }
+                accumulators.insert(
+                    pid,
+                    PesAccumulator {
+                        kind,
+                        data: payload.to_vec(),
+                    },
+                );
             }
-            accumulators.insert(
-                pid,
-                PesAccumulator {
-                    kind,
-                    data: payload.to_vec(),
-                },
-            );
         } else if let Some(accumulator) = accumulators.get_mut(&pid) {
             accumulator.data.extend_from_slice(payload);
         }
@@ -341,6 +368,29 @@ fn flush_pes(accumulator: PesAccumulator, result: &mut DemuxOutput) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Checks if a PES packet's elementary-stream payload starts with an Annex B
+/// start code (`00 00 01` or `00 00 00 01`).
+///
+/// Returns `None` if the PES header cannot be parsed (caller should fall back
+/// to the default flush-and-restart behavior). Returns `Some(true)` if the ES
+/// payload starts with a start code (new access unit). Returns `Some(false)` if
+/// it does not (continuation of a NAL unit split across PES packets).
+fn pes_starts_new_access_unit(payload: &[u8]) -> Option<bool> {
+    // PES structure: 00 00 01 <stream_id> <len:2> <flags> <flags> <hdr_data_len> <optional> <ES payload>
+    if payload.len() < 9 || payload[0..3] != [0x00, 0x00, 0x01] {
+        return None;
+    }
+    let header_data_length = payload[8] as usize;
+    let es_start = 9 + header_data_length;
+    if es_start >= payload.len() {
+        return None;
+    }
+    let es = &payload[es_start..];
+    let has_start_code = (es.len() >= 4 && es[0] == 0 && es[1] == 0 && es[2] == 0 && es[3] == 1)
+        || (es.len() >= 3 && es[0] == 0 && es[1] == 0 && es[2] == 1);
+    Some(has_start_code)
 }
 
 fn parse_pes_header(data: &[u8]) -> Result<PesHeader> {

@@ -14,3 +14,8 @@
 
 # Trae workspace state
 /.trae
+
+# output
+ouput.mp4
+output.partial.mp4
+*.mp4
