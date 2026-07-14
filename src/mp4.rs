@@ -578,16 +578,27 @@ fn mdhd_box(timescale: u32, duration: u64) -> Result<Vec<u8>> {
 
 /// MP4 creation time as seconds since 1904-01-01 00:00:00 UTC (the MP4
 /// epoch). Falls back to 0 if the wall clock is unavailable.
+///
+/// On `wasm32-unknown-unknown`, `SystemTime::now()` panics ("time not
+/// implemented on this platform"), so we return 0 unconditionally. A
+/// zero creation timestamp is harmless for playback.
 fn creation_time() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Seconds between 1904-01-01 and 1970-01-01.
-    const EPOCH_OFFSET: u64 = 2_082_844_800;
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| EPOCH_OFFSET.checked_add(d.as_secs()))
-        .and_then(|s| u32::try_from(s).ok())
-        .unwrap_or(0)
+    #[cfg(target_arch = "wasm32")]
+    {
+        0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        // Seconds between 1904-01-01 and 1970-01-01.
+        const EPOCH_OFFSET: u64 = 2_082_844_800;
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|d| EPOCH_OFFSET.checked_add(d.as_secs()))
+            .and_then(|s| u32::try_from(s).ok())
+            .unwrap_or(0)
+    }
 }
 
 fn hdlr_box(track: &Mp4Track) -> Vec<u8> {

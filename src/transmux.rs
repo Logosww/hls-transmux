@@ -1,4 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::cancel::CancelToken;
@@ -260,102 +262,129 @@ pub async fn transmux_hls_to_mp4_async(
     output: impl AsRef<Path>,
     options: TransmuxOptions,
 ) -> Result<TransmuxReport> {
-    let output = output.as_ref();
-    let (root_location, source) = input.into_parts()?;
-    let reader = SourceReader::new(source);
-    let root_resource = reader.read_text(&root_location).await?;
-    let (media_playlist, media_location) =
-        resolve_media_playlist(&reader, &root_resource, options.variant).await?;
-
-    // `Mp4` batch path can't resume (it buffers everything in memory and
-    // writes once at the end — there's nothing to append to). Reject early
-    // so callers get a clear error instead of silent fallback.
-    if options.resume.is_some() && matches!(options.output_format, OutputFormat::Mp4) {
-        return Err(Error::invalid(
-            "resume is only supported with OutputFormat::StreamingMp4 or FragmentedMp4",
+    // On wasm32, file system APIs (tokio::fs) are unavailable. Keep the
+    // symbol so consumers don't get link errors, but return a clear error
+    // guiding them to the writer / bytes API.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (&input, &output, &options);
+        return Err(Error::unsupported(
+            "transmux_hls_to_mp4_async is not available on wasm32 (requires file system); \
+             use transmux_hls_to_writer_async or transmux_hls_to_mp4_bytes instead",
         ));
     }
 
-    let hooks = Hooks {
-        on_progress: options.on_progress.as_ref(),
-        cancel: options.cancel.as_ref(),
-    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let output = output.as_ref();
+        let (root_location, source) = input.into_parts()?;
+        let reader = SourceReader::new(source);
+        let root_resource = reader.read_text(&root_location).await?;
+        let (media_playlist, media_location) =
+            resolve_media_playlist(&reader, &root_resource, options.variant).await?;
 
-    match options.output_format {
-        OutputFormat::Mp4 => {
-            mux_to_mp4(&reader, &media_location, &media_playlist, output, &hooks).await
+        // `Mp4` batch path can't resume (it buffers everything in memory and
+        // writes once at the end — there's nothing to append to). Reject early
+        // so callers get a clear error instead of silent fallback.
+        if options.resume.is_some() && matches!(options.output_format, OutputFormat::Mp4) {
+            return Err(Error::invalid(
+                "resume is only supported with OutputFormat::StreamingMp4 or FragmentedMp4",
+            ));
         }
-        OutputFormat::FragmentedMp4 => {
-            transmux_fragmented_async(
-                &reader,
-                &media_location,
-                &media_playlist,
-                output,
-                &hooks,
-                options.resume.clone(),
-            )
-            .await
-        }
-        OutputFormat::StreamingMp4 => {
-            // Stage 1: stream the fMP4 pipeline to a temp file (low memory:
-            // sample data lands on disk as each segment is demuxed). Stage 2:
-            // read it back and defrag into a single ftyp + moov + mdat
-            // (faststart). The temp file is a playable fMP4 if interrupted.
-            let temp_path = temp_fmp4_path(output);
-            let stage1 = transmux_fragmented_async(
-                &reader,
-                &media_location,
-                &media_playlist,
-                &temp_path,
-                &hooks,
-                options.resume.clone(),
-            )
-            .await;
-            if let Err(e) = stage1 {
-                // On cancel, keep the .partial.mp4 so the caller can resume.
-                // Only clean up on actual errors (non-Cancelled).
-                if !matches!(e, Error::Cancelled) {
-                    let _ = tokio::fs::remove_file(&temp_path).await;
-                }
-                return Err(e);
+
+        let hooks = Hooks {
+            on_progress: options.on_progress.as_ref(),
+            cancel: options.cancel.as_ref(),
+        };
+
+        match options.output_format {
+            OutputFormat::Mp4 => {
+                mux_to_mp4(&reader, &media_location, &media_playlist, output, &hooks).await
             }
-            let segment_count = media_playlist.segments.len();
-
-            // Stage 2: defrag. Native path uses the crate's own ISOBMFF demux
-            // + MP4 mux; ffmpeg path (behind `ffmpeg-finalize`) delegates to
-            // ffmpeg-next for the remux.
-            #[cfg(feature = "ffmpeg-finalize")]
-            let result = match options.finalize_backend {
-                FinalizeBackend::Native => {
-                    defragment_fmp4_to_mp4(&temp_path, output, segment_count).await
+            OutputFormat::FragmentedMp4 => {
+                transmux_fragmented_async(
+                    &reader,
+                    &media_location,
+                    &media_playlist,
+                    output,
+                    &hooks,
+                    options.resume.clone(),
+                )
+                .await
+            }
+            OutputFormat::StreamingMp4 => {
+                // Stage 1: stream the fMP4 pipeline to a temp file (low memory:
+                // sample data lands on disk as each segment is demuxed). Stage 2:
+                // read it back and defrag into a single ftyp + moov + mdat
+                // (faststart). The temp file is a playable fMP4 if interrupted.
+                let temp_path = temp_fmp4_path(output);
+                let stage1 = transmux_fragmented_async(
+                    &reader,
+                    &media_location,
+                    &media_playlist,
+                    &temp_path,
+                    &hooks,
+                    options.resume.clone(),
+                )
+                .await;
+                if let Err(e) = stage1 {
+                    // On cancel, keep the .partial.mp4 so the caller can resume.
+                    // Only clean up on actual errors (non-Cancelled).
+                    if !matches!(e, Error::Cancelled) {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                    }
+                    return Err(e);
                 }
-                FinalizeBackend::Ffmpeg => {
-                    crate::ffmpeg_finalize::remux_to_mp4(&temp_path, output, segment_count).await
-                }
-            };
-            #[cfg(not(feature = "ffmpeg-finalize"))]
-            let result = defragment_fmp4_to_mp4(&temp_path, output, segment_count).await;
+                let segment_count = media_playlist.segments.len();
 
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            result
+                // Stage 2: defrag. Native path uses the crate's own ISOBMFF demux
+                // + MP4 mux; ffmpeg path (behind `ffmpeg-finalize`) delegates to
+                // ffmpeg-next for the remux.
+                #[cfg(feature = "ffmpeg-finalize")]
+                let result = match options.finalize_backend {
+                    FinalizeBackend::Native => {
+                        defragment_fmp4_to_mp4(&temp_path, output, segment_count).await
+                    }
+                    FinalizeBackend::Ffmpeg => {
+                        crate::ffmpeg_finalize::remux_to_mp4(&temp_path, output, segment_count).await
+                    }
+                };
+                #[cfg(not(feature = "ffmpeg-finalize"))]
+                let result = defragment_fmp4_to_mp4(&temp_path, output, segment_count).await;
+
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                result
+            }
         }
     }
 }
 
-/// Streams HLS to a fragmented MP4 written directly into `writer`.
+/// Transmuxes HLS to an MP4 written directly into `writer`.
 ///
 /// Unlike [`transmux_hls_to_mp4_async`] (which writes to a file path), this
 /// entry point accepts any [`tokio::io::AsyncWrite`] sink — an HTTP response
-/// body, a `tokio::io::duplex`, a pipe, or an in-memory `Vec<u8>`. The
-/// transmuxer writes `ftyp` + `moov` after the first segment is demuxed, then
-/// one `styp` + `moof` + `mdat` per segment as it is consumed, so the sink
-/// receives playable fMP4 bytes before all segments are processed.
+/// body, a `tokio::io::duplex`, a pipe, or an in-memory `Vec<u8>`. No file
+/// system access is required, so this function works on all targets including
+/// `wasm32-unknown-unknown`.
+///
+/// # Output formats
+///
+/// - [`OutputFormat::FragmentedMp4`]: streaming pipeline. The transmuxer
+///   writes `ftyp` + `moov` after the first segment is demuxed, then one
+///   `styp` + `moof` + `mdat` per segment as it is consumed, so the sink
+///   receives playable fMP4 bytes before all segments are processed.
+/// - [`OutputFormat::Mp4`]: batch pipeline. All segments are demuxed into
+///   memory, muxed into a single `ftyp` + `moov` + `mdat`, then written to
+///   the sink in one shot. The entire MP4 is buffered before writing —
+///   suitable for `download()` semantics (e.g. blob: downloads in a
+///   browser). For long inputs where peak memory is a concern, use
+///   `FragmentedMp4` instead.
+/// - [`OutputFormat::StreamingMp4`]: rejected with [`Error::InvalidInput`].
+///   `StreamingMp4` requires a file system for its defrag stage; use
+///   `OutputFormat::Mp4` for classic MP4 output via the writer API.
 ///
 /// # Constraints
 ///
-/// - `options.output_format` **must** be [`OutputFormat::FragmentedMp4`].
-///   [`OutputFormat::Mp4`] (batch pipeline) and [`OutputFormat::StreamingMp4`]
-///   (defragments at end) are rejected with [`Error::InvalidInput`].
 /// - `options.resume` **must** be `None`. Resume requires re-reading the
 ///   already-written output to rebuild the `mfra` index, which is not possible
 ///   for a non-seekable sink. Passing `Some` is rejected with
@@ -408,27 +437,7 @@ pub async fn transmux_hls_to_writer_async<W>(
 where
     W: tokio::io::AsyncWrite + Send + Unpin,
 {
-    match options.output_format {
-        OutputFormat::Mp4 => {
-            return Err(Error::invalid(
-                "writer API requires OutputFormat::FragmentedMp4; \
-                 Mp4 uses a batch pipeline that buffers everything in memory",
-            ));
-        }
-        OutputFormat::StreamingMp4 => {
-            return Err(Error::invalid(
-                "writer API requires OutputFormat::FragmentedMp4; \
-                 StreamingMp4 defragments at end and cannot stream",
-            ));
-        }
-        OutputFormat::FragmentedMp4 => {}
-    }
-
-    if options.resume.is_some() {
-        return Err(Error::invalid(
-            "writer API does not support resume (sink is not seekable)",
-        ));
-    }
+    use tokio::io::AsyncWriteExt;
 
     let (root_location, source) = input.into_parts()?;
     let reader = SourceReader::new(source);
@@ -441,17 +450,95 @@ where
         cancel: options.cancel.as_ref(),
     };
 
-    transmux_fragmented_to_writer(
-        &reader,
-        &media_location,
-        &media_playlist,
-        writer,
-        &hooks,
-        None, // resume: always None (rejected above)
-        None, // resume_existing: always None (writer sink not re-readable)
-        options.write_mfra,
+    match options.output_format {
+        OutputFormat::Mp4 => {
+            // Batch pipeline: demux all segments → mux to classic MP4 Vec<u8>
+            // → write to writer. No file system needed; works on wasm32.
+            // The entire MP4 is buffered in memory before writing, so the
+            // sink receives all bytes at once (not streaming).
+            if options.resume.is_some() {
+                return Err(Error::invalid(
+                    "resume is only supported with OutputFormat::StreamingMp4 or FragmentedMp4",
+                ));
+            }
+            let (mp4, mut report) =
+                mux_to_mp4_bytes(&reader, &media_location, &media_playlist, &hooks).await?;
+            writer.write_all(&mp4).await?;
+            writer.flush().await?;
+            report.bytes_written = mp4.len() as u64;
+            Ok(report)
+        }
+        OutputFormat::FragmentedMp4 => {
+            if options.resume.is_some() {
+                return Err(Error::invalid(
+                    "writer API does not support resume (sink is not seekable)",
+                ));
+            }
+            transmux_fragmented_to_writer(
+                &reader,
+                &media_location,
+                &media_playlist,
+                writer,
+                &hooks,
+                None, // resume: always None (rejected above)
+                None, // resume_existing: always None (writer sink not re-readable)
+                options.write_mfra,
+            )
+            .await
+        }
+        OutputFormat::StreamingMp4 => Err(Error::invalid(
+            "writer API does not support OutputFormat::StreamingMp4 \
+             (requires file system for defrag); use OutputFormat::Mp4 for \
+             classic MP4 or OutputFormat::FragmentedMp4 for streaming",
+        )),
+    }
+}
+
+/// Convenience wrapper: transmuxes HLS to a classic MP4 (`ftyp` + `moov` +
+/// `mdat`) returned as `Vec<u8>`. No file system access — works on all
+/// targets including `wasm32-unknown-unknown`.
+///
+/// Uses the batch pipeline: all segments are demuxed into memory before
+/// muxing. For long inputs where peak memory is a concern, use
+/// [`transmux_hls_to_writer_async`] with [`OutputFormat::FragmentedMp4`]
+/// for streaming output.
+///
+/// `options.output_format` is overridden to [`OutputFormat::Mp4`]; other
+/// options (`variant`, `on_progress`, `cancel`) are honored. `resume` is
+/// rejected (batch pipeline does not support resume).
+///
+/// # Example
+///
+/// ```no_run
+/// use hls_transmux::{
+///     HlsInput, TransmuxOptions, transmux_hls_to_mp4_bytes,
+/// };
+///
+/// # async fn run() -> hls_transmux::Result<()> {
+/// let (bytes, report) = transmux_hls_to_mp4_bytes(
+///     HlsInput::Path("playlist.m3u8".into()),
+///     TransmuxOptions::default(),
+/// )
+/// .await?;
+/// println!("{} bytes, {} segments", bytes.len(), report.segment_count);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn transmux_hls_to_mp4_bytes(
+    input: HlsInput,
+    options: TransmuxOptions,
+) -> Result<(Vec<u8>, TransmuxReport)> {
+    let mut buf: Vec<u8> = Vec::new();
+    let report = transmux_hls_to_writer_async(
+        input,
+        &mut buf,
+        TransmuxOptions {
+            output_format: OutputFormat::Mp4,
+            ..options
+        },
     )
-    .await
+    .await?;
+    Ok((buf, report))
 }
 
 /// Resolves the root resource into a `(MediaPlaylist, SourceLocation)` pair.
@@ -493,9 +580,28 @@ async fn resolve_media_playlist(
     }
 }
 
-/// Streaming demux + standard MP4 mux. Downloads and demuxes one HLS segment
-/// at a time into a [`PacketCollector`], then muxes everything into a single
-/// `ftyp` + `moov` + `mdat` file.
+/// Batch pipeline: demux all segments into a [`PacketCollector`], then mux
+/// to a classic MP4 `Vec<u8>` (`ftyp` + `moov` + `mdat`). No file system
+/// access — works on all targets including `wasm32-unknown-unknown`.
+///
+/// The entire MP4 is buffered in memory before being returned. For long
+/// inputs where peak memory is a concern, use the fragmented streaming
+/// pipeline ([`transmux_fragmented_to_writer`]) instead.
+async fn mux_to_mp4_bytes(
+    reader: &SourceReader,
+    media_location: &SourceLocation,
+    media_playlist: &MediaPlaylist,
+    hooks: &Hooks<'_>,
+) -> Result<(Vec<u8>, TransmuxReport)> {
+    let mut collector = PacketCollector::default();
+    read_media_segments(reader, media_location, media_playlist, &mut collector, hooks).await?;
+    let (mp4, report) = mux_collected_packets(collector, media_playlist.segments.len())?;
+    Ok((mp4, report))
+}
+
+/// Streaming demux + standard MP4 mux to a file path. Native only — uses
+/// `tokio::fs::write`.
+#[cfg(not(target_arch = "wasm32"))]
 async fn mux_to_mp4(
     reader: &SourceReader,
     media_location: &SourceLocation,
@@ -503,10 +609,8 @@ async fn mux_to_mp4(
     output: &Path,
     hooks: &Hooks<'_>,
 ) -> Result<TransmuxReport> {
-    let mut collector = PacketCollector::default();
-    read_media_segments(reader, media_location, media_playlist, &mut collector, hooks).await?;
-
-    let (mp4, mut report) = mux_collected_packets(collector, media_playlist.segments.len())?;
+    let (mp4, mut report) =
+        mux_to_mp4_bytes(reader, media_location, media_playlist, hooks).await?;
     tokio::fs::write(output, &mp4).await?;
     report.bytes_written = mp4.len() as u64;
     Ok(report)
@@ -519,6 +623,9 @@ async fn mux_to_mp4(
 /// init portion (`ftyp` + `moov`) and a media portion (everything after),
 /// then fed to `demux_isobmff` which walks every `moof`/`trun` to recover
 /// samples. The samples are then re-muxed via `Mp4Muxer`.
+///
+/// Native only — reads/writes temp files via `tokio::fs`.
+#[cfg(not(target_arch = "wasm32"))]
 async fn defragment_fmp4_to_mp4(
     fmp4_path: &Path,
     output: &Path,
@@ -539,6 +646,7 @@ async fn defragment_fmp4_to_mp4(
 
 /// Splits a fragmented MP4 file into init (`ftyp` + `moov`) and media (the
 /// rest). Returns the byte offset where the media portion begins.
+#[cfg(not(target_arch = "wasm32"))]
 fn split_fmp4_init(data: &[u8]) -> Result<usize> {
     let mut offset = 0;
     let mut saw_ftyp = false;
@@ -585,6 +693,9 @@ fn split_fmp4_init(data: &[u8]) -> Result<usize> {
 /// Temp file path for stage 1 of the finalized-fragmented path. Uses `.mp4`
 /// (a real fragmented MP4 file) so that if the process is interrupted the
 /// temp file is still a playable fMP4.
+///
+/// Native only — only used by the file-path `StreamingMp4` pipeline.
+#[cfg(not(target_arch = "wasm32"))]
 fn temp_fmp4_path(output: &Path) -> PathBuf {
     let mut p = output.to_path_buf();
     let stem = p.file_stem().map(|s| s.to_os_string()).unwrap_or_default();
@@ -599,6 +710,9 @@ fn temp_fmp4_path(output: &Path) -> PathBuf {
     p
 }
 
+/// File-path fragmented MP4 transmux. Native only — uses `tokio::fs` for
+/// file create/append/read (resume path).
+#[cfg(not(target_arch = "wasm32"))]
 async fn transmux_fragmented_async(
     reader: &SourceReader,
     media_location: &SourceLocation,

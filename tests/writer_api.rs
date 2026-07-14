@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use hls_transmux::{
     ByteRange, Error, HlsInput, OutputFormat, Source, SourceLocation, TextResource,
     TransmuxOptions, TransmuxProgress, TransmuxResumeState, transmux_hls_to_mp4_async,
-    transmux_hls_to_writer_async,
+    transmux_hls_to_mp4_bytes, transmux_hls_to_writer_async,
 };
 use tokio::io::AsyncReadExt;
 
@@ -244,13 +244,13 @@ fn find_box_offset(data: &[u8], btype: &[u8; 4]) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: writer rejects OutputFormat::Mp4
+// Test 2: writer produces a valid classic MP4 with OutputFormat::Mp4
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn writer_rejects_mp4_format() {
+async fn writer_produces_classic_mp4() {
     let mut buf: Vec<u8> = Vec::new();
-    let err = transmux_hls_to_writer_async(
+    let report = transmux_hls_to_writer_async(
         mock_input(1),
         &mut buf,
         TransmuxOptions {
@@ -259,14 +259,109 @@ async fn writer_rejects_mp4_format() {
         },
     )
     .await
-    .expect_err("Mp4 format should be rejected");
+    .expect("Mp4 writer transmux should succeed");
+
+    // The buffer should contain exactly report.bytes_written bytes.
+    assert_eq!(
+        buf.len() as u64,
+        report.bytes_written,
+        "buffer length should match report.bytes_written"
+    );
+    // Verify classic MP4 layout: ftyp + moov + mdat.
+    assert_eq!(&buf[4..8], b"ftyp", "first box should be ftyp");
     assert!(
-        matches!(err, Error::InvalidInput(_)),
-        "expected Error::InvalidInput, got {err:?}"
+        find_box_offset(&buf, b"moov").is_some(),
+        "output should contain a moov box"
     );
     assert!(
-        buf.is_empty(),
-        "no bytes should be written on rejection"
+        find_box_offset(&buf, b"mdat").is_some(),
+        "output should contain an mdat box"
+    );
+    // Classic MP4 should NOT contain moof (fragmented) boxes.
+    assert!(
+        find_box_offset(&buf, b"moof").is_none(),
+        "classic MP4 should not contain moof boxes"
+    );
+    assert!(report.duration > 0, "duration should be non-zero");
+    assert!(!report.tracks.is_empty(), "Mp4 report should have track info");
+}
+
+// ---------------------------------------------------------------------------
+// Test 2b: transmux_hls_to_mp4_bytes returns valid classic MP4 bytes
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mp4_bytes_returns_valid_mp4() {
+    let (bytes, report) = transmux_hls_to_mp4_bytes(
+        mock_input(1),
+        TransmuxOptions::default(),
+    )
+    .await
+    .expect("mp4_bytes transmux should succeed");
+
+    assert!(!bytes.is_empty(), "output bytes should be non-empty");
+    assert_eq!(&bytes[4..8], b"ftyp", "first box should be ftyp");
+    assert!(
+        find_box_offset(&bytes, b"moov").is_some(),
+        "output should contain a moov box"
+    );
+    assert!(
+        find_box_offset(&bytes, b"mdat").is_some(),
+        "output should contain an mdat box"
+    );
+    assert_eq!(report.segment_count, 1);
+    assert_eq!(
+        bytes.len() as u64,
+        report.bytes_written,
+        "bytes length should match report.bytes_written"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 2c: writer Mp4 output matches file Mp4 output (after timestamp normalization)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn writer_mp4_matches_file_mp4() {
+    let dir = temp_dir("mp4-match");
+    let file_output = dir.join("output.mp4");
+
+    // File path version.
+    transmux_hls_to_mp4_async(
+        mock_input(1),
+        &file_output,
+        TransmuxOptions {
+            output_format: OutputFormat::Mp4,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("file path transmux should succeed");
+    let file_bytes = std::fs::read(&file_output).expect("file output should exist");
+
+    // Writer version.
+    let mut writer_bytes: Vec<u8> = Vec::new();
+    transmux_hls_to_writer_async(
+        mock_input(1),
+        &mut writer_bytes,
+        TransmuxOptions {
+            output_format: OutputFormat::Mp4,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("writer transmux should succeed");
+
+    // Normalize wall-clock timestamps, then compare byte-for-byte.
+    let mut file_norm = file_bytes.clone();
+    let mut writer_norm = writer_bytes.clone();
+    normalize_moov_timestamps(&mut file_norm);
+    normalize_moov_timestamps(&mut writer_norm);
+    assert_eq!(
+        writer_norm.as_slice(),
+        file_norm.as_slice(),
+        "writer Mp4 output should be byte-identical to file Mp4 output \
+         after timestamp normalization"
     );
 }
 

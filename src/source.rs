@@ -7,7 +7,6 @@ use url::Url;
 
 use crate::error::{Error, Result};
 
-#[cfg(feature = "default-source")]
 use std::collections::HashMap;
 
 /// A byte sub-range within a larger resource, used for `#EXT-X-BYTERANGE`
@@ -541,7 +540,6 @@ impl SourceReader {
     }
 }
 
-#[cfg(feature = "default-source")]
 fn apply_range(bytes: Vec<u8>, range: Option<&ByteRange>) -> Result<Vec<u8>> {
     let Some(range) = range else {
         return Ok(bytes);
@@ -559,6 +557,132 @@ fn apply_range(bytes: Vec<u8>, range: Option<&ByteRange>) -> Result<Vec<u8>> {
         ));
     }
     Ok(bytes[start..end].to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// MemorySource: in-memory Source for WASM / browser contexts.
+// ---------------------------------------------------------------------------
+
+/// In-memory [`Source`] implementation for environments where the caller has
+/// pre-fetched all playlist text and segment bytes (e.g. a browser that
+/// downloaded everything via `fetch()` before invoking the WASM transmuxer).
+///
+/// Keys are absolute URL strings (or filesystem path strings). The
+/// transmuxer resolves relative URIs found in playlists against the
+/// playlist's [`SourceLocation`], so the keys must match the resolved
+/// absolute URLs/paths.
+///
+/// `#EXT-X-BYTERANGE` is supported: when [`Source::read_bytes`] is called
+/// with a [`ByteRange`], the full segment bytes are looked up by URL and then
+/// sliced.
+///
+/// # Example (WASM / no-default-features)
+///
+/// ```no_run
+/// use std::collections::HashMap;
+/// use std::sync::Arc;
+/// use hls_transmux::{HlsInput, MemorySource, OutputFormat, SourceLocation,
+///     TransmuxOptions, transmux_hls_to_writer_async};
+///
+/// # async fn run() -> hls_transmux::Result<()> {
+/// let mut texts = HashMap::new();
+/// texts.insert(
+///     "https://example.com/media.m3u8".to_string(),
+///     "#EXTM3U\n#EXT-X-TARGETDURATION:8\n#EXTINF:7.0,\nseg0.ts\n#EXT-X-ENDLIST\n".to_string(),
+/// );
+/// let mut bytes = HashMap::new();
+/// bytes.insert(
+///     "https://example.com/seg0.ts".to_string(),
+///     std::fs::read("seg0.ts").unwrap(),
+/// );
+/// let source = MemorySource::with_data(texts, bytes);
+/// let location = SourceLocation::Url(
+///     url::Url::parse("https://example.com/media.m3u8").unwrap(),
+/// );
+/// let input = HlsInput::custom(Arc::new(source), location);
+/// let mut buf: Vec<u8> = Vec::new();
+/// transmux_hls_to_writer_async(input, &mut buf, TransmuxOptions {
+///     output_format: OutputFormat::FragmentedMp4,
+///     ..Default::default()
+/// }).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Default, Clone)]
+pub struct MemorySource {
+    texts: HashMap<String, String>,
+    bytes: HashMap<String, Vec<u8>>,
+}
+
+impl MemorySource {
+    /// Creates an empty `MemorySource`. Use [`Self::text`] / [`Self::segment`]
+    /// (builder style) or [`Self::with_data`] to populate.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a `MemorySource` from pre-fetched playlist texts and segment
+    /// bytes. Both maps are keyed by absolute URL string (or filesystem path
+    /// string for `SourceLocation::File`).
+    pub fn with_data(
+        texts: HashMap<String, String>,
+        bytes: HashMap<String, Vec<u8>>,
+    ) -> Self {
+        Self { texts, bytes }
+    }
+
+    /// Adds a playlist text keyed by its absolute URL (builder style).
+    pub fn text(mut self, url: impl Into<String>, content: impl Into<String>) -> Self {
+        self.texts.insert(url.into(), content.into());
+        self
+    }
+
+    /// Adds segment bytes keyed by the segment's absolute URL (builder style).
+    pub fn segment(mut self, url: impl Into<String>, data: impl Into<Vec<u8>>) -> Self {
+        self.bytes.insert(url.into(), data.into());
+        self
+    }
+}
+
+impl Source for MemorySource {
+    fn read_text<'a>(
+        &'a self,
+        location: &'a SourceLocation,
+    ) -> Pin<Box<dyn Future<Output = Result<TextResource>> + Send + 'a>> {
+        Box::pin(async move {
+            let key = location_key(location);
+            let content = self.texts.get(&key).ok_or_else(|| {
+                Error::invalid(format!("MemorySource: no text found for {key}"))
+            })?;
+            Ok(TextResource {
+                content: content.clone(),
+                location: location.clone(),
+            })
+        })
+    }
+
+    fn read_bytes<'a>(
+        &'a self,
+        location: &'a SourceLocation,
+        range: Option<&'a ByteRange>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move {
+            let key = location_key(location);
+            let bytes = self.bytes.get(&key).ok_or_else(|| {
+                Error::invalid(format!("MemorySource: no bytes found for {key}"))
+            })?;
+            apply_range(bytes.clone(), range)
+        })
+    }
+}
+
+/// Produces the lookup key for a `SourceLocation`. For URLs, the canonical
+/// string form; for files, the path as a string.
+fn location_key(location: &SourceLocation) -> String {
+    match location {
+        SourceLocation::Url(url) => url.to_string(),
+        SourceLocation::File(path) => path.to_string_lossy().into_owned(),
+    }
 }
 
 // ---------------------------------------------------------------------------
