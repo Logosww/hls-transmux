@@ -51,7 +51,7 @@ hls-transmux = { version = "0.2", default-features = false }
 
 Optionally enable `ffmpeg-finalize` to remux via ffmpeg (through `ffmpeg-next`)
 during `StreamingMp4` finalization instead of the built-in defrag path. Requires
-FFmpeg 8 shared libraries and pkg-config on the system:
+FFmpeg 9 shared libraries and pkg-config on the system:
 
 ```toml
 [dependencies]
@@ -755,7 +755,7 @@ hls-transmux = { version = "0.2", default-features = false }
 ```
 
 可选启用 `ffmpeg-finalize` feature，在 `StreamingMp4` finalization 阶段用
-ffmpeg（via `ffmpeg-next`）做 remux，替代自研 defrag 路径。需要系统安装 FFmpeg 8
+ffmpeg（via `ffmpeg-next`）做 remux，替代自研 defrag 路径。需要系统安装 FFmpeg 9
 共享库 + pkg-config：
 
 ```toml

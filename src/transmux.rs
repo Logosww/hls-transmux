@@ -98,7 +98,7 @@ pub enum FinalizeBackend {
     #[default]
     Native,
     /// Use ffmpeg (via `ffmpeg-next`) to remux the temp fMP4 into a standard
-    /// MP4. Requires the `ffmpeg-finalize` cargo feature and FFmpeg 8 shared
+    /// MP4. Requires the `ffmpeg-finalize` cargo feature and FFmpeg 9 shared
     /// libraries at build time. Useful when you want to defer to ffmpeg's
     /// battle-tested muxer or need ffmpeg-specific box layout.
     #[cfg(feature = "ffmpeg-finalize")]
